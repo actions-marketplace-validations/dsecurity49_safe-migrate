@@ -1,6 +1,6 @@
 # CLI and Report Contract
 
-This document defines safe-migrate v0.8.1's CLI, report, cache, and GitHub
+This document defines safe-migrate v0.9.0's CLI, report, cache, and GitHub
 Action behavior.
 
 If you are learning safe-migrate, start with the [README](../README.md). This
@@ -143,13 +143,15 @@ not production runtime, lock duration, application compatibility, or backfills.
 
 No cache means `Tainted`; rules retain their conservative defaults. A stale
 cache also taints confidence and warns on standard error.
-`stale_stats_days` uses the cache timestamp, not file modification time.
+`stale_stats_days` uses the cache timestamp, not file modification time. A
+missing or future-dated timestamp is stale; inspection reports no calculable
+age for either case.
 
 PostgreSQL conflicts such as dropping a missing column produce a Tier 1
 `chain-conflict`, leave state unchanged, and do not taint confidence by
 themselves. This applies to both `lint` and `lint-chain`.
 
-Cache V7 supplies typed evidence for:
+Cache V8 supplies typed evidence for:
 
 - catalog coverage, schema scope, roles, privileges, and session settings;
 - constraint keys and expressions, generated-column sources, and PostgreSQL's
@@ -167,7 +169,8 @@ The principal precision boundaries are:
 
 | Area | Contract |
 | --- | --- |
-| Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes copied/inherited tables, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
+| Unsupported DDL | Parser-valid but unmodeled semantics are opaque and `Tainted`, never exact no-ops. This includes unsupported copying/inheritance forms, CTAS lifecycle actions, unsupported role attributes, and unmodeled database, type, view, materialized-view, domain, or aggregate details. |
+| Partitions | Synchronized predicates retain catalog evidence. Local retained-CHECK synthesis supports simple single-column RANGE/LIST bounds; expression keys, multi-column bounds, and missing ancestor predicates remain conservative. Full local predicate generation is not yet complete. |
 | Indexes | Synchronized complex-index dependencies support exact cleanup. Locally parsed complex indexes do not claim that precision. CTAS `WITH NO DATA` and expression indexes remain available to safety rules. |
 | Grants and policies | `ALL TABLES IN SCHEMA` and policy role/expression changes are `Tainted`; their useful modeled effects remain available to security rules. PostgreSQL 17+ `MAINTAIN` is recognized only with a versioned baseline. |
 | Routines and settings | All synchronized routine kinds are modeled; routine DDL without a typed Squawk extractor is opaque. Unknown `RESET` parameters are opaque, while modeled timeouts/search path and schema-neutral settings remain exact. |
@@ -181,7 +184,7 @@ They require positive effective values for statements identified by Squawk's
 pinned `possibly_slow_stmt` classifier. `lock_timeout` must also be shorter than
 a positive `statement_timeout`.
 
-Values begin from Cache V7, or unknown without a cache. Ordered `SET`, local
+Values begin from Cache V8, or unknown without a cache. Ordered `SET`, local
 settings, resets, commits, and rollbacks follow PostgreSQL session/local
 behavior. `SET LOCAL` outside a transaction has no modeled effect. Each rule
 reports at most once per input file.
@@ -198,12 +201,12 @@ These conditions exit `1` instead of producing a clean report:
 - internal serialization or analysis failure.
 
 Sync replaces a cache only after its new payload is complete. An automatic
-refresh failure is recorded in JSON and may reuse a readable V7 cache; otherwise
+refresh failure is recorded in JSON and may reuse a readable V8 cache; otherwise
 analysis continues without a baseline and is `Tainted`.
 
 Encrypted mode requires `cache_encryption = true` and a valid
 `SAFE_MIGRATE_CACHE_KEY`. Cache modes cannot be mixed; switching requires a new
-`sync`. V7 carries an explicit header, coverage and scope-completion markers,
+`sync`. V8 carries an explicit header, coverage and scope-completion markers,
 role/session provenance, schemas, settings, dependencies, and redacted catalog
 metadata. It never contains password hashes or subscription connection strings.
 V1–V6 and unheadered caches are rejected with resync guidance.

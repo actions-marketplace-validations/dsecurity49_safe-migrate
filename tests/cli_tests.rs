@@ -7,7 +7,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
 };
 use safe_migrate::_internal::ast::identifiers::ObjectId;
-use safe_migrate::_internal::db::cache::{CACHE_V7_MAGIC, DbCache, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCache, DbCacheVersioned};
 use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use safe_migrate::_internal::model::schema::SchemaState;
 
@@ -44,9 +44,9 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
     let config = bincode::config::standard().with_variable_int_encoding();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     bincode::serde::encode_into_std_write(
-        DbCacheVersioned::V7(Box::new(cache)),
+        DbCacheVersioned::V8(Box::new(cache)),
         &mut encoder,
         config,
     )
@@ -57,7 +57,7 @@ fn write_cache_with_timestamp(path: &std::path::Path, created_at_unix_secs: u64)
 
 #[test]
 fn test_cli_help() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("--help");
     let output = cmd.output().unwrap();
     assert!(output.status.success());
@@ -73,7 +73,7 @@ fn test_cli_help() {
 
 #[test]
 fn init_cache_key_generates_expected_secret_format() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd.args(["init", "cache-key"]).output().unwrap();
     assert!(output.status.success());
     assert!(output.stderr.is_empty());
@@ -101,7 +101,7 @@ fn init_cache_key_sends_secret_to_github_cli_over_stdin() {
     fs::set_permissions(&fake_gh, permissions).unwrap();
     let existing_path = std::env::var("PATH").unwrap_or_default();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.args(["init", "cache-key", "--set-github-secret"])
         .env("CAPTURED_SECRET", &captured)
         .env(
@@ -121,7 +121,7 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("migrations")).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.current_dir(project.path())
         .args(["init", "github-actions", "--path", "migrations"])
         .assert()
@@ -155,7 +155,7 @@ fn init_github_actions_creates_separate_analysis_and_baseline_workflows() {
     assert!(!baseline.contains("actions/checkout"));
     assert!(!baseline.contains("\n          path:"));
 
-    let mut overwrite = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut overwrite = crate::common::safe_migrate_command();
     let assertion = overwrite
         .current_dir(project.path())
         .args(["init", "github-actions", "--path", "migrations"])
@@ -172,7 +172,7 @@ fn init_github_actions_supports_a_custom_default_branch_and_output_directory() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("db [migrations]")).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.current_dir(project.path())
         .args([
             "init",
@@ -199,7 +199,7 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
     let project = tempfile::tempdir().unwrap();
     fs::create_dir(project.path().join("migrations")).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assertion = cmd
         .current_dir(project.path())
         .args([
@@ -231,13 +231,13 @@ fn init_github_actions_does_not_read_secrets_from_noninteractive_input() {
 
 #[test]
 fn rules_command_lists_registry_descriptors_in_json() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd.arg("rules").arg("--json").output().unwrap();
     assert!(output.status.success());
     let report = parse_json_stdout(&output);
     assert_eq!(report["schema_version"], 2);
     let rules = report["rules"].as_array().expect("rules array");
-    assert_eq!(rules.len(), 28);
+    assert_eq!(rules.len(), 29);
     assert_eq!(rules[0]["id"], "irreversible-migration");
     assert_eq!(rules[0]["title"], "Irreversible migration");
     assert!(
@@ -264,7 +264,7 @@ fn rules_command_lists_registry_descriptors_in_json() {
 
 #[test]
 fn rules_command_separates_human_descriptors() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd.arg("rules").arg("--no-color").output().unwrap();
     assert!(output.status.success());
     let stdout = String::from_utf8(output.stdout).unwrap();
@@ -275,13 +275,13 @@ fn rules_command_separates_human_descriptors() {
             .lines()
             .filter(|line| line.len() >= 40 && line.bytes().all(|byte| byte == b'-'))
             .count(),
-        27
+        28
     );
 }
 
 #[test]
 fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd
         .arg("rules")
         .arg("--rule")
@@ -300,7 +300,7 @@ fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
         "[rules.require-concurrent-index]\ndisabled = true\ntier1_threshold_rows = 123\ntier2_threshold_rows = 45"
     )
     .unwrap();
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd
         .arg("rules")
         .arg("--rule")
@@ -322,7 +322,7 @@ fn rules_command_filters_one_rule_and_rejects_unknown_ids() {
         45
     );
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("rules")
         .arg("--rule")
@@ -342,7 +342,7 @@ fn test_cli_rejects_unknown_configured_rule_id() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "[rules.concurent-index]\ndisabled = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -366,7 +366,7 @@ fn test_cli_rejects_thresholds_unsupported_by_a_rule() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("rules")
         .arg("--json")
@@ -385,7 +385,7 @@ fn test_cli_rejects_unknown_configuration_setting() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_syn = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -402,9 +402,24 @@ fn test_cli_rejects_unknown_configuration_setting() {
 
 #[test]
 fn test_cli_lint_nonexistent_file() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("lint").arg("--file").arg("nonexistent_file.sql");
     cmd.assert().failure();
+}
+
+#[test]
+fn test_cli_errors_render_control_characters_inertly() {
+    let mut cmd = crate::common::safe_migrate_command();
+    let assert = cmd
+        .arg("lint")
+        .arg("--file")
+        .arg("missing\x1b[2J.sql")
+        .assert()
+        .failure();
+    let stderr = String::from_utf8_lossy(&assert.get_output().stderr);
+
+    assert!(!stderr.contains('\x1b'));
+    assert!(stderr.contains("\\u{1b}[2J"), "stderr was: {stderr}");
 }
 
 #[test]
@@ -415,7 +430,7 @@ fn test_cli_lint_invalid_cache() {
     let mut corrupted_cache = tempfile::NamedTempFile::new().unwrap();
     writeln!(corrupted_cache, "invalid json data").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("lint")
         .arg("--file")
         .arg(sql_file.path())
@@ -437,16 +452,16 @@ fn test_cli_rejects_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
     let cache = tempfile::NamedTempFile::new().unwrap();
     fs::write(cache.path(), compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -474,10 +489,10 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     );
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::new(invalid)), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::new(invalid)), config).unwrap();
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.finish().unwrap();
 
@@ -495,7 +510,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "cache_encryption = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .env("SAFE_MIGRATE_CACHE_KEY", "2a".repeat(32))
         .arg("cache")
@@ -518,7 +533,7 @@ fn test_cli_rejects_authenticated_semantically_contradictory_v7_cache() {
 fn test_cli_rejects_malformed_cache_payload() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
     // Preserve the current enum discriminant, then corrupt the payload.
     let mut malicious = encoded[..4].to_vec();
     malicious.push(252);
@@ -526,14 +541,14 @@ fn test_cli_rejects_malformed_cache_payload() {
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&malicious).unwrap();
     encoder.finish().unwrap();
 
     let mut cache = tempfile::NamedTempFile::new().unwrap();
     cache.write_all(&compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("cache")
         .arg("inspect")
         .arg("--cache")
@@ -551,11 +566,11 @@ fn test_cli_rejects_malformed_cache_payload() {
 fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let config = bincode::config::standard().with_variable_int_encoding();
     let encoded =
-        bincode::serde::encode_to_vec(DbCacheVersioned::V7(Box::default()), config).unwrap();
+        bincode::serde::encode_to_vec(DbCacheVersioned::V8(Box::default()), config).unwrap();
 
     let mut compressed = Vec::new();
     let mut encoder = zstd::stream::Encoder::new(&mut compressed, 3).unwrap();
-    encoder.write_all(CACHE_V7_MAGIC).unwrap();
+    encoder.write_all(CACHE_V8_MAGIC).unwrap();
     encoder.write_all(&encoded).unwrap();
     encoder.write_all(b"trailing-data").unwrap();
     encoder.finish().unwrap();
@@ -563,7 +578,7 @@ fn test_cli_rejects_trailing_data_after_streamed_cache_decode() {
     let mut cache = tempfile::NamedTempFile::new().unwrap();
     cache.write_all(&compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -588,7 +603,7 @@ fn test_cache_inspect_rejects_unsupported_legacy_cache_without_exposing_its_vers
     let cache = tempfile::NamedTempFile::new().unwrap();
     fs::write(cache.path(), compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -617,7 +632,7 @@ fn test_cache_inspect_rejects_headered_legacy_caches() {
         let cache = tempfile::NamedTempFile::new().unwrap();
         fs::write(cache.path(), compressed).unwrap();
 
-        let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+        let mut cmd = crate::common::safe_migrate_command();
         let assert = cmd
             .arg("cache")
             .arg("inspect")
@@ -643,7 +658,7 @@ fn test_cache_inspect_rejects_unknown_unheadered_cache_generically() {
     let cache = tempfile::NamedTempFile::new().unwrap();
     fs::write(cache.path(), compressed).unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -659,7 +674,7 @@ fn test_cache_inspect_rejects_unknown_unheadered_cache_generically() {
 
 #[test]
 fn test_cli_sync_no_db_url() {
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("sync");
     // Ensure DATABASE_URL is not set
     cmd.env_remove("DATABASE_URL");
@@ -672,7 +687,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let cache_path = temp_dir.path().join("baseline.cache");
     write_fresh_cache(&cache_path);
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -684,7 +699,7 @@ fn test_cache_inspect_outputs_a_redacted_json_summary() {
     let report = parse_json_stdout(assert.get_output());
 
     assert_eq!(report["path"], cache_path.display().to_string());
-    assert_eq!(report["format_version"], 7);
+    assert_eq!(report["format_version"], 8);
     assert_eq!(report["encrypted"], false);
     assert_eq!(report["coverage"]["schema_scope"], "all_non_system");
     assert!(report["coverage"]["families"].is_array());
@@ -717,7 +732,7 @@ fn test_cache_inspect_human_summary_discloses_redaction() {
     let cache_path = temp_dir.path().join("baseline.cache");
     write_fresh_cache(&cache_path);
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("cache")
         .arg("inspect")
@@ -747,7 +762,7 @@ fn test_cli_json_is_machine_clean_and_marks_missing_baseline_tainted() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -774,7 +789,7 @@ fn test_cli_no_cache_does_not_invent_schema_drift() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "ALTER TABLE widgets ADD COLUMN status text;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -802,7 +817,7 @@ fn test_cli_no_cache_bypasses_configured_auto_sync() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -828,7 +843,7 @@ fn test_cli_no_auto_sync_uses_cache_without_database_access() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -858,7 +873,7 @@ fn explicit_missing_config_is_an_error_for_lint_and_rules() {
     let missing = sql_file.path().with_extension("missing.toml");
 
     for command in ["lint", "rules"] {
-        let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+        let mut cmd = crate::common::safe_migrate_command();
         cmd.arg(command);
         if command == "lint" {
             cmd.arg("--file").arg(sql_file.path()).arg("--no-cache");
@@ -875,7 +890,7 @@ fn lint_chain_rejects_a_directory_without_sql_files() {
     let directory = tempfile::tempdir().unwrap();
     fs::write(directory.path().join("README.txt"), "not a migration").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd
         .arg("lint-chain")
         .arg("--dir")
@@ -894,7 +909,7 @@ fn empty_configured_schema_scope_fails_before_auto_sync() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true\nschemas = []").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let output = cmd
         .arg("lint")
         .arg("--file")
@@ -918,7 +933,7 @@ fn test_cli_auto_sync_failure_continues_without_a_cache() {
     let cache_dir = tempfile::tempdir().unwrap();
     let cache_path = cache_dir.path().join("missing.cache");
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -951,7 +966,7 @@ fn test_cli_auto_sync_failure_uses_the_previous_cache() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -982,7 +997,7 @@ fn test_cli_auto_sync_failure_keeps_fresh_cache_confidence_exact() {
     let mut config_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(config_file, "auto_sync = true").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -1017,7 +1032,7 @@ fn test_cli_json_halt_is_json_and_uses_blocking_exit_status() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "DROP DATABASE production;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -1064,7 +1079,7 @@ fn test_cli_json_statement_index_counts_preceding_schema_neutral_statements() {
     writeln!(sql_file, "COMMENT ON TABLE widgets IS 'migration note';").unwrap();
     writeln!(sql_file, "DROP DATABASE production;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -1089,7 +1104,7 @@ fn test_cli_markdown_report_is_machine_clean_and_includes_location() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "DROP DATABASE production;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -1117,7 +1132,7 @@ fn test_cli_chain_json_reports_the_source_file_for_findings() {
     let migration = dir.path().join("002_drop_database.sql");
     fs::write(&migration, "DROP DATABASE production;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint-chain")
         .arg("--dir")
@@ -1143,7 +1158,7 @@ fn test_cli_json_locations_preserve_offsets_through_execute_normalization() {
     writeln!(sql_file, "-- generated migration").unwrap();
     writeln!(sql_file, "EXECUTE 'DROP DATABASE production';").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")
@@ -1169,7 +1184,7 @@ fn test_cli_rejects_json_and_markdown_together() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("lint")
         .arg("--file")
         .arg(sql_file.path())
@@ -1184,7 +1199,7 @@ fn test_cli_human_halt_uses_blocking_exit_status() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "DROP DATABASE production;").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     cmd.arg("lint")
         .arg("--file")
         .arg(sql_file.path())
@@ -1202,7 +1217,7 @@ fn test_cli_chain_json_is_machine_clean() {
     )
     .unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint-chain")
         .arg("--dir")
@@ -1224,7 +1239,7 @@ fn test_cli_rejects_json_and_interactive_together() {
     let mut sql_file = tempfile::NamedTempFile::new().unwrap();
     writeln!(sql_file, "CREATE TABLE widgets (id bigint PRIMARY KEY);").unwrap();
 
-    let mut cmd = assert_cmd::Command::cargo_bin("safe-migrate").unwrap();
+    let mut cmd = crate::common::safe_migrate_command();
     let assert = cmd
         .arg("lint")
         .arg("--file")

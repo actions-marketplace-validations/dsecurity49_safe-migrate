@@ -1,5 +1,24 @@
 # Contributing to safe-migrate
 
+## Start with an issue
+
+Before submitting a new issue, [search existing issues](https://github.com/dsecurity49/safe-migrate/issues),
+including closed ones, for similar reports or proposals. If one already covers
+your topic, add any new information there rather than opening a duplicate.
+
+Otherwise, [open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose).
+For substantial changes, discuss the approach before starting implementation.
+For bug reports, include:
+
+- minimal SQL;
+- expected and actual output;
+- safe-migrate version;
+- PostgreSQL version or assumed version;
+- whether a cache was used;
+- relevant configuration, with credentials and other secrets removed.
+
+## How analysis works
+
 Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
 with typed AST extraction, stateful schema simulation, and safety rules.
 
@@ -29,7 +48,7 @@ src/_internal/engine/     configuration, orchestration, and rule dispatch
 src/_internal/model/      modeled PostgreSQL objects
 src/_internal/report/     human, JSON, and interactive reporting
 src/_internal/rules/      safety rule implementations
-src/api.rs                supported Rust integration façade
+src/api.rs, src/api/      supported Rust integration API
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
 docs/           Action guide and CLI/report contract
@@ -55,6 +74,10 @@ cargo test rule_evaluation
 cargo test architectural_gap
 cargo test expression_parsing
 ```
+
+Implementation tests are registered under the library target (`--lib`), not
+individual `--test` targets. The independent public API suite uses
+`cargo test --locked --test api_facade`.
 
 End-to-end fixtures:
 
@@ -182,7 +205,7 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
-Cache V7 synchronizes every PostgreSQL routine kind, publications, redacted
+Cache V8 synchronizes every PostgreSQL routine kind, publications, redacted
 subscription metadata, and explicit catalog coverage. Never query or store
 `pg_subscription.subconninfo`.
 Changes to the cache model require serialization and inspection regressions,
@@ -196,15 +219,3 @@ versions.
 - Use idiomatic Rust naming and four-space indentation.
 - Keep one rule concept per file or focused module.
 - Document non-obvious undo-log and dependency-graph behavior inline.
-
-## Reporting bugs
-
-[Open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose)
-with:
-
-- minimal SQL;
-- expected and actual output;
-- safe-migrate version;
-- PostgreSQL version or assumed version;
-- whether a cache was used;
-- relevant configuration.

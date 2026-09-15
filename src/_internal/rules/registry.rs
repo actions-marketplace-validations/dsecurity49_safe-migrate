@@ -17,7 +17,7 @@ use crate::_internal::rules::policies::RestrictivePolicyRule;
 use crate::_internal::rules::security::OverbroadGrantRule;
 use crate::_internal::rules::timeouts::{RequireLockTimeoutRule, RequireStatementTimeoutRule};
 use crate::_internal::rules::transactions::{
-    AlterTypeAddValueRule, ConcurrentInsideTransactionRule, VacuumFullRule,
+    AlterTypeAddValueRule, ConcurrentInsideTransactionRule, LockTableRule, VacuumFullRule,
 };
 use crate::_internal::rules::triggers::DisableTriggerRule;
 use crate::_internal::rules::views::MaterializedViewRefreshRule;
@@ -27,7 +27,7 @@ use crate::_internal::rules::views::MaterializedViewRefreshRule;
 /// Keep this registry in evaluation order. Discovery, configuration validation,
 /// documentation checks, and engine construction all read it. Auxiliary
 /// findings emitted by a primary rule are not entries.
-pub struct RuleDescriptor {
+pub(crate) struct RuleDescriptor {
     pub id: &'static str,
     pub title: &'static str,
     pub summary: &'static str,
@@ -37,20 +37,10 @@ pub struct RuleDescriptor {
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum RuleConfigurationField {
+pub(crate) enum RuleConfigurationField {
     Disabled,
     Tier1ThresholdRows,
     Tier2ThresholdRows,
-}
-
-impl RuleConfigurationField {
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            Self::Disabled => "disabled",
-            Self::Tier1ThresholdRows => "tier1_threshold_rows",
-            Self::Tier2ThresholdRows => "tier2_threshold_rows",
-        }
-    }
 }
 
 const DISABLED_ONLY: &[RuleConfigurationField] = &[RuleConfigurationField::Disabled];
@@ -65,19 +55,19 @@ const WITH_ROW_THRESHOLDS: &[RuleConfigurationField] = &[
 ];
 
 impl RuleDescriptor {
-    pub fn build(&self) -> Box<dyn Rule> {
+    pub(crate) fn build(&self) -> Box<dyn Rule> {
         (self.factory)()
     }
 
-    pub fn default_tier(&self) -> ViolationTier {
+    pub(crate) fn default_tier(&self) -> ViolationTier {
         self.build().default_tier()
     }
 
-    pub fn recipe(&self) -> &'static str {
+    pub(crate) fn recipe(&self) -> &'static str {
         self.build().recipe()
     }
 
-    pub fn supports(&self, field: RuleConfigurationField) -> bool {
+    pub(crate) fn supports(&self, field: RuleConfigurationField) -> bool {
         self.supported_configuration_fields.contains(&field)
     }
 }
@@ -100,7 +90,7 @@ macro_rules! descriptor {
 
 // Marker rules are currently zero-sized; their constructors are kept in this
 // registry so future initialized rules can supply a dedicated factory.
-pub static PRIMARY_RULES: &[RuleDescriptor] = &[
+pub(crate) static PRIMARY_RULES: &[RuleDescriptor] = &[
     descriptor!(
         "irreversible-migration",
         "Irreversible migration",
@@ -108,6 +98,13 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
         "data loss",
         ReversibilityRule,
         WITH_TIER1_THRESHOLD
+    ),
+    descriptor!(
+        "table-lock",
+        "Strong table lock",
+        "Flags explicit locks that can block concurrent work.",
+        "availability",
+        LockTableRule
     ),
     descriptor!(
         "drop-database",
@@ -306,16 +303,16 @@ pub static PRIMARY_RULES: &[RuleDescriptor] = &[
     ),
 ];
 
-pub fn primary_rule_ids() -> impl Iterator<Item = &'static str> {
+pub(crate) fn primary_rule_ids() -> impl Iterator<Item = &'static str> {
     PRIMARY_RULES.iter().map(|rule| rule.id)
 }
 
-pub fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
+pub(crate) fn find_primary_rule(id: &str) -> Option<&'static RuleDescriptor> {
     PRIMARY_RULES.iter().find(|rule| rule.id == id)
 }
 
-pub fn validate_rule_configuration(
-    config: &crate::_internal::engine::config::Config,
+pub(crate) fn validate_rule_configuration(
+    config: &crate::api::config::Config,
 ) -> Result<(), String> {
     if config.tier1_threshold_rows < config.tier2_threshold_rows {
         return Err(format!(
@@ -361,7 +358,7 @@ pub fn validate_rule_configuration(
     Ok(())
 }
 
-pub fn build_primary_rules() -> Vec<Box<dyn Rule>> {
+pub(crate) fn build_primary_rules() -> Vec<Box<dyn Rule>> {
     PRIMARY_RULES.iter().map(RuleDescriptor::build).collect()
 }
 
@@ -453,10 +450,10 @@ mod tests {
 
     #[test]
     fn threshold_validation_requires_tier1_at_or_above_tier2() {
-        let globally_reversed = crate::_internal::engine::config::Config {
+        let globally_reversed = crate::api::config::Config {
             tier1_threshold_rows: 9,
             tier2_threshold_rows: 10,
-            ..crate::_internal::engine::config::Config::default()
+            ..crate::api::config::Config::default()
         };
         assert!(
             validate_rule_configuration(&globally_reversed)
@@ -464,13 +461,13 @@ mod tests {
                 .contains("tier1_threshold_rows (9)")
         );
 
-        let mut per_rule_reversed = crate::_internal::engine::config::Config::default();
+        let mut per_rule_reversed = crate::api::config::Config::default();
         per_rule_reversed.rules.insert(
             "blocking-constraint".into(),
-            crate::_internal::engine::config::RuleConfig {
+            crate::api::config::RuleConfig {
                 tier1_threshold_rows: Some(5),
                 tier2_threshold_rows: Some(6),
-                ..crate::_internal::engine::config::RuleConfig::default()
+                ..crate::api::config::RuleConfig::default()
             },
         );
         assert!(
@@ -482,12 +479,12 @@ mod tests {
 
     #[test]
     fn unsupported_per_rule_thresholds_are_rejected() {
-        let mut config = crate::_internal::engine::config::Config::default();
+        let mut config = crate::api::config::Config::default();
         config.rules.insert(
             "require-lock-timeout".to_string(),
-            crate::_internal::engine::config::RuleConfig {
+            crate::api::config::RuleConfig {
                 tier1_threshold_rows: Some(1),
-                ..crate::_internal::engine::config::RuleConfig::default()
+                ..crate::api::config::RuleConfig::default()
             },
         );
 

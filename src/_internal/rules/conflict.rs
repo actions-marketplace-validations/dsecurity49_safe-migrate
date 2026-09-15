@@ -2,7 +2,7 @@ use crate::_internal::analysis::state::MutationResult;
 use crate::_internal::report::violations::{ObjectKind, OperationKind, Violation, ViolationTier};
 use crate::_internal::rules::{Rule, RuleContext};
 
-pub struct ConflictRule;
+pub(crate) struct ConflictRule;
 
 impl ConflictRule {
     const ID: &'static str = "chain-conflict";
@@ -65,7 +65,7 @@ mod tests {
     use super::*;
     use crate::_internal::analysis::mutations::Mutation;
     use crate::_internal::analysis::state::MutationResult;
-    use crate::_internal::engine::config::Config;
+    use crate::api::config::Config;
     use std::collections::{HashMap, HashSet};
 
     #[test]

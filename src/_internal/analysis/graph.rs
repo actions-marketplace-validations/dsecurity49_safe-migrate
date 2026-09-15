@@ -3,7 +3,7 @@ use std::cell::OnceCell;
 use std::collections::{HashMap, HashSet};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub enum DependencyKind {
+pub(crate) enum DependencyKind {
     ForeignKey {
         constraint_name: Option<String>,
         from_columns: Vec<String>,
@@ -31,6 +31,7 @@ pub enum DependencyKind {
         has_predicate: bool,
         is_concurrent: bool,
         is_unique: bool,
+        is_immediate: bool,
         is_valid: bool,
         is_ready: bool,
         is_live: bool,
@@ -60,6 +61,9 @@ pub enum DependencyKind {
     /// ordinary table inheritance.
     InheritanceOf,
     PartitionOf,
+    /// A `DETACH PARTITION CONCURRENTLY` interrupted after its first internal
+    /// transaction remains attached until `FINALIZE` completes it.
+    PartitionDetachPending,
     SequenceOwnedBy {
         column: String,
     },
@@ -81,21 +85,21 @@ pub enum DependencyKind {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct ForeignKeyOperatorEvidence {
+pub(crate) struct ForeignKeyOperatorEvidence {
     pub pk_fk: Vec<String>,
     pub pk_pk: Vec<String>,
     pub fk_fk: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-pub struct DependencyEdge {
+pub(crate) struct DependencyEdge {
     pub dependent: ObjectId,
     pub referenced: ObjectId,
     pub kind: DependencyKind,
 }
 
 impl DependencyEdge {
-    pub fn new(dependent: ObjectId, referenced: ObjectId, kind: DependencyKind) -> Self {
+    pub(crate) fn new(dependent: ObjectId, referenced: ObjectId, kind: DependencyKind) -> Self {
         Self {
             dependent,
             referenced,
@@ -105,7 +109,7 @@ impl DependencyEdge {
 }
 
 #[derive(Debug, Default)]
-pub struct DependencyGraph {
+pub(crate) struct DependencyGraph {
     edges: Vec<DependencyEdge>,
     edge_set: HashSet<DependencyEdge>,
     indexes: OnceCell<GraphIndexes>,
@@ -132,15 +136,15 @@ impl Clone for DependencyGraph {
 impl DependencyGraph {
     const CASCADE_INDEX_MIN_EDGES: usize = 1_024;
 
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self::default()
     }
 
-    pub fn edges(&self) -> &[DependencyEdge] {
+    pub(crate) fn edges(&self) -> &[DependencyEdge] {
         &self.edges
     }
 
-    pub fn add_edge(&mut self, edge: DependencyEdge) {
+    pub(crate) fn add_edge(&mut self, edge: DependencyEdge) {
         // The dependency graph is a set of typed relationships. Replaying a
         // hydration row or an idempotent mutation must not multiply cascade
         // work or make traversal results depend on insertion history.
@@ -201,7 +205,7 @@ impl DependencyGraph {
 
     /// Confirms that every derived lookup points at the canonical edge list.
     /// This is intentionally cheap to call from invariant tests, not hot paths.
-    pub fn indexes_are_valid(&self) -> bool {
+    pub(crate) fn indexes_are_valid(&self) -> bool {
         self.indexes() == &Self::build_indexes(&self.edges)
     }
 
@@ -264,7 +268,7 @@ impl DependencyGraph {
             .map(|index| &self.edges[*index])
     }
 
-    pub fn cascade_edges(&self, id: &ObjectId) -> Vec<&DependencyEdge> {
+    pub(crate) fn cascade_edges(&self, id: &ObjectId) -> Vec<&DependencyEdge> {
         if self.edges.len() < Self::CASCADE_INDEX_MIN_EDGES {
             let target = self.resolve_rename(id);
             return self
@@ -278,6 +282,7 @@ impl DependencyGraph {
                             | DependencyKind::ForeignKey { .. }
                             | DependencyKind::InheritanceOf
                             | DependencyKind::PartitionOf
+                            | DependencyKind::PartitionDetachPending
                     ) && self.resolve_rename(&edge.referenced) == target
                 })
                 .collect();
@@ -291,6 +296,7 @@ impl DependencyGraph {
                         | DependencyKind::ForeignKey { .. }
                         | DependencyKind::InheritanceOf
                         | DependencyKind::PartitionOf
+                        | DependencyKind::PartitionDetachPending
                 )
             })
             .collect()
@@ -301,7 +307,8 @@ impl DependencyGraph {
     }
 
     // Dependency lookups follow the current end of a rename chain.
-    pub fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
+    #[cfg(test)]
+    pub(crate) fn is_referenced_by_view(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
                 .resolved_referenced_edges(id)
@@ -320,7 +327,8 @@ impl DependencyGraph {
             .collect()
     }
 
-    pub fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
+    #[cfg(test)]
+    pub(crate) fn is_referenced_by_fk(&self, id: &ObjectId) -> Vec<(&ObjectId, u64)> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
                 .resolved_referenced_edges(id)
@@ -353,7 +361,8 @@ impl DependencyGraph {
             .collect()
     }
 
-    pub fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
+    #[cfg(test)]
+    pub(crate) fn is_referenced_by_index(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
                 .resolved_referenced_edges(id)
@@ -372,11 +381,17 @@ impl DependencyGraph {
             .collect()
     }
 
-    pub fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
+    #[cfg(test)]
+    pub(crate) fn partitions_of(&self, id: &ObjectId) -> Vec<&ObjectId> {
         if self.edges.len() >= Self::CASCADE_INDEX_MIN_EDGES {
             return self
                 .resolved_referenced_edges(id)
-                .filter(|edge| matches!(edge.kind, DependencyKind::PartitionOf))
+                .filter(|edge| {
+                    matches!(
+                        edge.kind,
+                        DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                    )
+                })
                 .map(|edge| self.resolve_rename(&edge.dependent))
                 .collect();
         }
@@ -384,14 +399,16 @@ impl DependencyGraph {
         self.edges
             .iter()
             .filter(|e| {
-                matches!(e.kind, DependencyKind::PartitionOf)
-                    && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
+                matches!(
+                    e.kind,
+                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                ) && (self.resolve_rename(&e.referenced) == target || &e.referenced == id)
             })
             .map(|e| self.resolve_rename(&e.dependent))
             .collect()
     }
 
-    pub fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
+    pub(crate) fn resolve_rename<'a>(&'a self, id: &'a ObjectId) -> &'a ObjectId {
         // A rename back to an earlier name is valid PostgreSQL. The indexed
         // resolver retains the same cycle fallback while avoiding a full edge
         // scan for every dependency lookup on large baselines.
@@ -399,7 +416,7 @@ impl DependencyGraph {
     }
 
     // Partition ancestry must remain acyclic.
-    pub fn check_partition_cycle(&self, parent: &ObjectId, child: &ObjectId) -> bool {
+    pub(crate) fn check_partition_cycle(&self, parent: &ObjectId, child: &ObjectId) -> bool {
         let resolved_parent = self.resolve_rename(parent);
         let resolved_child = self.resolve_rename(child);
         if resolved_parent == resolved_child {
@@ -415,8 +432,10 @@ impl DependencyGraph {
                 return true;
             }
             let maybe_edge = self.edges.iter().find(|edge| {
-                matches!(edge.kind, DependencyKind::PartitionOf)
-                    && self.resolve_rename(&edge.dependent) == current_parent
+                matches!(
+                    edge.kind,
+                    DependencyKind::PartitionOf | DependencyKind::PartitionDetachPending
+                ) && self.resolve_rename(&edge.dependent) == current_parent
             });
             if let Some(edge) = maybe_edge {
                 let p = self.resolve_rename(&edge.referenced);
@@ -426,6 +445,36 @@ impl DependencyGraph {
                 current_parent = p;
             } else {
                 break;
+            }
+        }
+        false
+    }
+
+    /// Traditional inheritance has the same acyclicity requirement as a
+    /// partition tree, but must not treat a partition-only edge as ordinary
+    /// inheritance when callers validate `ALTER TABLE .. INHERIT`.
+    pub(crate) fn check_inheritance_cycle(&self, parent: &ObjectId, child: &ObjectId) -> bool {
+        let resolved_parent = self.resolve_rename(parent);
+        let resolved_child = self.resolve_rename(child);
+        if resolved_parent == resolved_child {
+            return true;
+        }
+
+        let mut pending = vec![resolved_parent];
+        let mut visited = HashSet::new();
+        while let Some(current) = pending.pop() {
+            if !visited.insert(current.clone()) {
+                continue;
+            }
+            for edge in self.edges.iter().filter(|edge| {
+                matches!(edge.kind, DependencyKind::InheritanceOf)
+                    && self.resolve_rename(&edge.dependent) == current
+            }) {
+                let ancestor = self.resolve_rename(&edge.referenced);
+                if ancestor == resolved_child {
+                    return true;
+                }
+                pending.push(ancestor);
             }
         }
         false
@@ -470,7 +519,7 @@ impl DependencyGraph {
     /// and publications are represented by a synthetic `public/<name>` ID, so
     /// a generic endpoint rewrite can otherwise corrupt an unrelated edge when
     /// two namespaces happen to share a name.
-    pub fn propagate_relation_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    pub(crate) fn propagate_relation_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
             match &mut edge.kind {
                 DependencyKind::RenameTo => {}
@@ -478,6 +527,7 @@ impl DependencyGraph {
                 | DependencyKind::ViewDependency { .. }
                 | DependencyKind::InheritanceOf
                 | DependencyKind::PartitionOf
+                | DependencyKind::PartitionDetachPending
                 | DependencyKind::ConstraintDependency { .. }
                 | DependencyKind::ColumnGeneratedFrom { .. } => {
                     if edge.dependent == *old_id {
@@ -520,7 +570,7 @@ impl DependencyGraph {
 
     /// Propagate an index rename.  Indexes are dependent endpoints of their
     /// `IndexOnRelation` edges; they are not relation references.
-    pub fn propagate_index_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    pub(crate) fn propagate_index_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
             if matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
                 && edge.dependent == *old_id
@@ -535,7 +585,7 @@ impl DependencyGraph {
     /// Propagate a sequence rename through every typed sequence endpoint.
     /// Ownership uses the sequence as a dependent; a column default uses it
     /// as a referenced object. Both must follow the canonical identity.
-    pub fn propagate_sequence_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    pub(crate) fn propagate_sequence_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
             match &edge.kind {
                 DependencyKind::SequenceOwnedBy { .. } if edge.dependent == *old_id => {
@@ -552,7 +602,7 @@ impl DependencyGraph {
     }
 
     /// Propagate a trigger rename through its trigger edge and payload.
-    pub fn propagate_trigger_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    pub(crate) fn propagate_trigger_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
             if let DependencyKind::TriggerOnTable { trigger_id, .. } = &mut edge.kind
                 && *trigger_id == *old_id
@@ -568,7 +618,7 @@ impl DependencyGraph {
     }
 
     /// Propagate a function rename through trigger dependency payloads.
-    pub fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    pub(crate) fn propagate_function_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         for edge in &mut self.edges {
             if let DependencyKind::TriggerOnTable { function_id, .. } = &mut edge.kind
                 && *function_id == *old_id
@@ -581,7 +631,7 @@ impl DependencyGraph {
     }
 
     /// Rename a foreign-key constraint payload owned by a relation.
-    pub fn rename_foreign_key_constraint(
+    pub(crate) fn rename_constraint(
         &mut self,
         table_id: &ObjectId,
         old_name: &str,
@@ -589,13 +639,25 @@ impl DependencyGraph {
     ) {
         self.mutate_edges(|edges| {
             for edge in edges {
-                if edge.dependent == *table_id
-                    && let DependencyKind::ForeignKey {
+                if edge.dependent != *table_id {
+                    continue;
+                }
+                let name = match &mut edge.kind {
+                    DependencyKind::ForeignKey {
                         constraint_name: Some(name),
                         ..
-                    } = &mut edge.kind
-                    && name == old_name
-                {
+                    }
+                    | DependencyKind::ConstraintOnRelation {
+                        constraint_name: name,
+                        ..
+                    }
+                    | DependencyKind::ConstraintDependency {
+                        constraint_name: name,
+                        ..
+                    } => name,
+                    _ => continue,
+                };
+                if name == old_name {
                     *name = new_name.to_string();
                 }
             }
@@ -605,7 +667,7 @@ impl DependencyGraph {
     /// Rename a table column in all typed dependency payloads that can carry
     /// column identity. The endpoint direction determines whether the column
     /// is source-side or referenced-side for foreign keys.
-    pub fn rename_column_dependencies(
+    pub(crate) fn rename_column_dependencies(
         &mut self,
         table_id: &ObjectId,
         old_name: &str,
@@ -675,7 +737,12 @@ impl DependencyGraph {
     }
 
     /// Rename a column in an index definition attached to a relation.
-    pub fn rename_index_column(&mut self, table_id: &ObjectId, old_name: &str, new_name: &str) {
+    pub(crate) fn rename_index_column(
+        &mut self,
+        table_id: &ObjectId,
+        old_name: &str,
+        new_name: &str,
+    ) {
         self.mutate_edges(|edges| {
             for edge in edges {
                 if edge.referenced != *table_id {
@@ -704,7 +771,7 @@ impl DependencyGraph {
     }
 
     /// Rename the owned column recorded on a sequence edge.
-    pub fn rename_owned_sequence_column(
+    pub(crate) fn rename_owned_sequence_column(
         &mut self,
         sequence_id: &ObjectId,
         old_name: &str,
@@ -723,7 +790,7 @@ impl DependencyGraph {
     }
 
     /// Rename a publication node and its membership payloads.
-    pub fn rename_publication(&mut self, old_name: &str, new_name: &str) {
+    pub(crate) fn rename_publication(&mut self, old_name: &str, new_name: &str) {
         self.mutate_edges(|edges| {
             for edge in edges {
                 if let DependencyKind::PublicationIncludes { publication_name } = &mut edge.kind
@@ -741,20 +808,12 @@ impl DependencyGraph {
     /// New callers should use the typed helpers above.  Keeping this method
     /// relation-scoped prevents the old all-endpoints behavior from silently
     /// rewriting sequence, trigger, function, or publication identity data.
-    pub fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
+    #[cfg(test)]
+    pub(crate) fn propagate_rename(&mut self, old_id: &ObjectId, new_id: &ObjectId) {
         self.propagate_relation_rename(old_id, new_id);
     }
 
-    pub fn triggers_on(&self, table_id: &ObjectId) -> Vec<&DependencyEdge> {
-        self.edges
-            .iter()
-            .filter(|e| {
-                matches!(e.kind, DependencyKind::TriggerOnTable { .. }) && &e.referenced == table_id
-            })
-            .collect()
-    }
-
-    pub fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
+    pub(crate) fn triggers_for_function(&self, function_id: &ObjectId) -> Vec<&DependencyEdge> {
         self.edges
             .iter()
             .filter(|e| {
@@ -1015,6 +1074,7 @@ mod tests {
                 has_predicate: false,
                 is_concurrent: false,
                 is_unique: false,
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -1079,6 +1139,26 @@ mod tests {
             vec!["partition"]
         );
         assert!(graph.indexes_are_valid());
+    }
+
+    #[test]
+    fn inheritance_cycle_checks_every_parent_and_accepts_diamonds() {
+        let mut graph = DependencyGraph::new();
+        for (child, parent) in [
+            ("leaf", "left"),
+            ("leaf", "right"),
+            ("left", "root"),
+            ("right", "root"),
+        ] {
+            graph.add_edge(DependencyEdge::new(
+                id(child),
+                id(parent),
+                DependencyKind::InheritanceOf,
+            ));
+        }
+        assert!(graph.check_inheritance_cycle(&id("leaf"), &id("right")));
+        assert!(graph.check_inheritance_cycle(&id("leaf"), &id("root")));
+        assert!(!graph.check_inheritance_cycle(&id("leaf"), &id("new_child")));
     }
 
     #[test]

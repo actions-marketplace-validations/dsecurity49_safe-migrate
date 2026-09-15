@@ -1,6 +1,5 @@
-mod common;
-
-use common::{object_id, setup_engine};
+use crate::_internal::analysis::state::AnalysisState;
+use crate::common::{object_id, setup_engine};
 use safe_migrate::_internal::analysis::facts::{PublicationObjectFact, PublicationScope};
 use safe_migrate::_internal::analysis::graph::DependencyKind;
 use safe_migrate::_internal::db::cache::{DbCache, IndexCache};
@@ -9,7 +8,6 @@ use safe_migrate::_internal::model::role::RoleState;
 use safe_migrate::_internal::model::schema::{SchemaOverlay, SchemaState};
 use safe_migrate::_internal::model::sequence::{SequenceKind, SequenceOverlay, SequenceState};
 use safe_migrate::_internal::model::types::{TypeKind, TypeState};
-use safe_migrate::api::AnalysisState;
 
 fn cache_with_public_schema() -> DbCache {
     let mut cache = DbCache::new();
@@ -64,6 +62,7 @@ fn cache_v5_hydrates_schema_sequence_and_ownership_edge() {
             owner: object_id("", "owner"),
             owned_by: Some((table_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -159,6 +158,7 @@ fn schema_rename_remaps_namespace_and_rolls_back_atomically() {
             owner,
             owned_by: Some((table.clone(), "id".into())),
             kind: SequenceKind::Owned,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -308,6 +308,7 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
             owner: object_id("", "owner"),
             owned_by: Some((old_id.clone(), "id".into())),
             kind: SequenceKind::SerialLike,
+            parameters: Default::default(),
             generation: 0,
         },
     );
@@ -323,6 +324,7 @@ fn table_set_schema_moves_the_relation_and_preserves_baseline_origin() {
         has_expression_keys: false,
         has_predicate: false,
         is_unique: false,
+        is_immediate: true,
         is_valid: true,
         is_ready: true,
         is_live: true,

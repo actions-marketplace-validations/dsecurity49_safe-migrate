@@ -2,7 +2,7 @@ use crate::_internal::ast::identifiers::ObjectId;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct RoleState {
+pub(crate) struct RoleState {
     pub id: ObjectId, // role name, no schema
     pub can_login: bool,
     pub is_superuser: bool,
@@ -24,18 +24,24 @@ pub struct RoleState {
     pub can_set_role_to: Vec<ObjectId>,
 }
 
-/// PostgreSQL records the role that granted each membership.  Keeping this
-/// provenance separate from the option vectors lets revoke-CASCADE remove only
-/// memberships delegated by a grantor whose authority was withdrawn.
+/// PostgreSQL records the role that granted each membership alongside the
+/// per-record options.  Keeping this provenance separate from the option
+/// vectors lets revoke-CASCADE remove only memberships delegated by a
+/// grantor whose authority was withdrawn.  PostgreSQL 16+ stores one row per
+/// (member, role, grantor) triple, so several records may describe the same
+/// edge with different grantors and option values.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct RoleMembershipGrantor {
+pub(crate) struct RoleMembershipGrantor {
     pub member: ObjectId,
     pub role: ObjectId,
     pub grantor: ObjectId,
+    pub admin: bool,
+    pub inherit: bool,
+    pub set: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
-pub enum RoleOverlay {
+pub(crate) enum RoleOverlay {
     Present(RoleState),
     Dropped,
 }

@@ -5,6 +5,30 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.0 — 2026-09-15
+
+- Established `safe_migrate::api` as the supported Rust interface for analysis,
+  configuration, synchronization, and reporting; `_internal` is now private.
+- Unified API and CLI reports and evidence, with typed results, categorized
+  errors, and redacted database/cache-key inputs for embedded callers.
+- Added `table-lock` to flag explicit blocking locks, bringing the rule count
+  to 29.
+- Expanded SQL modeling for `TRUNCATE`, storage and column settings, inheritance,
+  partition detach, `SELECT INTO`, sequence options, and temporary-table commits.
+- Added Cache V8 metadata for CHECK definitions, extended statistics, column
+  inheritance, generated/identity columns, and partition-trigger parentage.
+- Improved constraint/index rename and drop propagation, generated CHECK names,
+  expression preservation, `LIKE` copies, and replica-identity eligibility checks.
+- Fixed concurrent-detach state and recursive rename collisions; invalidate
+  descendant predicates after ancestry changes. Unsupported predicate forms
+  remain conservative.
+- Track PostgreSQL 16+ role-membership grantors and per-grant options for more
+  accurate `REVOKE`/`CASCADE` analysis.
+- Hardened rollback, baseline/version validation, secret cleanup, and report
+  rendering; reject unsupported PostgreSQL-version assumptions.
+- Expanded live catalog comparisons and interrupted-detach coverage, repaired
+  the CI smoke-test target, and improved live scripts and crate packaging.
+
 ## v0.8.1 — 2026-09-06
 
 - Upgraded Squawk's parser, lexer, syntax tree, and linter to 2.64.0, including

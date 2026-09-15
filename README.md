@@ -29,7 +29,7 @@ Prebuilt binaries are available from
 installer verifies release checksums:
 
 ```bash
-VERSION='v0.8.1'
+VERSION='v0.9.0'
 curl -fsSL "https://raw.githubusercontent.com/dsecurity49/safe-migrate/${VERSION}/install.sh" |
   bash -s -- --version "${VERSION}"
 ```
@@ -50,7 +50,7 @@ Run `safe-migrate cache inspect` to view its provenance and redacted contents.
 
 ## What it checks
 
-The 28 built-in rules cover:
+The 29 built-in rules cover:
 
 - blocking locks, table rewrites, constraints, indexes, partitions, and
   materialized-view refreshes;
@@ -68,7 +68,7 @@ safe-migrate rules --rule require-concurrent-index
 
 ## GitHub Actions
 
-Create the `safe-migrate-baseline` GitHub environment, then run:
+Create and protect the `safe-migrate-baseline` GitHub environment, then run:
 
 ```bash
 safe-migrate init github-actions --path migrations --configure-secrets
@@ -155,6 +155,10 @@ disabled = true
 Unknown settings and rule IDs are rejected. `safe-migrate rules --json` lists
 the configuration supported by each rule.
 
+Without a synchronized baseline, the built-in version fallback is deliberately
+conservative. Set `assume_pg_version` only when the target is known to be
+PostgreSQL 14–18; for example, `assume_pg_version = 170000`.
+
 Suppress a reviewed finding with its primary rule ID:
 
 ```sql
@@ -178,8 +182,38 @@ Keep a positive `lock_timeout` shorter than a positive `statement_timeout`.
 
 ## Rust library
 
-Rust integrations should use the supported `safe_migrate::api` façade.
-Documentation is published on [docs.rs](https://docs.rs/safe-migrate).
+Rust integrations use `safe_migrate::api`. Load a synchronized baseline when
+one is available; otherwise choose explicit conservative analysis.
+
+```rust,no_run
+use safe_migrate::api::{self, Baseline, Config};
+use std::path::Path;
+
+let config = Config::load_from_file(Path::new("safe-migrate.toml"))?;
+let baseline = Baseline::load_optional(Path::new(".safe-migrate.cache"), &config)?;
+let outcome = api::analyze(
+    &config,
+    "2026-09-05_add_index.sql",
+    "CREATE INDEX ...",
+    &baseline,
+)?;
+
+if outcome.should_halt() {
+    eprintln!("{}", outcome.markdown());
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+`load_optional` treats only a missing cache as unavailable; corrupt,
+incompatible, or incorrectly encrypted caches remain errors. The API exposes
+typed immutable findings, verdicts, evidence, baseline inspection, rule
+metadata, and synchronization. Mutable parser, cache, and state-machine
+internals are not public. Full API documentation is on
+[docs.rs](https://docs.rs/safe-migrate).
+
+Embedded applications can call `sync_with_secrets` with a validated
+`DatabaseUrl` and optional `CacheKey`. This avoids changing process-wide
+environment variables; the CLI continues to read secrets from its environment.
 
 ## Contributing
 

@@ -1,12 +1,12 @@
 use crate::_internal::ast::identifiers::ObjectId;
 use crate::_internal::db::cache::{
-    CACHE_V7_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
+    CACHE_V8_MAGIC, CatalogCoverage, ConstraintDependencyCache, ConstraintKeyCache, DbCache,
     DbCacheVersioned, DefaultSequenceDependencyCache, ForeignKeyCache,
     GeneratedColumnDependencyCache, IndexCache, InheritanceCache, ViewDependencyCache,
 };
 use crate::_internal::db::cache_file::{
     MAX_CACHE_DECODE_BYTES, MAX_CACHE_FILE_BYTES, protect_cache_bytes,
-    validate_cache_encryption_configuration,
+    protect_cache_bytes_with_key, validate_cache_encryption_configuration,
 };
 use crate::_internal::model::relation::{Persistence, RelationKind, RelationState};
 use anyhow::{Context, Result};
@@ -17,6 +17,7 @@ use std::io::{self, Write};
 use std::path::Path;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use tempfile::NamedTempFile;
+use zeroize::Zeroizing;
 
 #[cfg(windows)]
 use std::fs;
@@ -24,31 +25,74 @@ use std::fs;
 const MIN_POSTGRES_VERSION_NUM: u32 = 140_000;
 const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-pub fn sync_cache(
+pub(crate) fn sync_cache(
     out_path: &Path,
     schemas: Option<&[String]>,
     cache_encryption: bool,
 ) -> Result<()> {
     validate_cache_encryption_configuration(cache_encryption)
         .context("Invalid cache encryption configuration")?;
-    // Strict env-only credential enforcement
-    let db_url = std::env::var("DATABASE_URL")
-        .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?;
+    let db_url = Zeroizing::new(
+        std::env::var("DATABASE_URL")
+            .context("DATABASE_URL environment variable is required to sync PostgreSQL schema metadata and statistics. Do not pass credentials via CLI flags or config files.")?,
+    );
     if db_url.trim().is_empty() {
         anyhow::bail!("DATABASE_URL must not be empty or whitespace");
     }
 
-    let mut client = connect_database(&db_url)?;
+    sync_cache_with_database_url(out_path, schemas, cache_encryption, &db_url)
+}
+
+pub(crate) fn validate_database_url(db_url: &str) -> Result<()> {
+    parse_database_config(db_url).map(|_| ())
+}
+
+pub(crate) fn sync_cache_with_database_url(
+    out_path: &Path,
+    schemas: Option<&[String]>,
+    cache_encryption: bool,
+    db_url: &str,
+) -> Result<()> {
+    validate_cache_encryption_configuration(cache_encryption)
+        .context("Invalid cache encryption configuration")?;
+    let mut client = connect_database(db_url)?;
 
     let cache = populate_cache(&mut client, schemas)?;
 
     write_cache(out_path, cache, cache_encryption)
 }
 
+pub(crate) fn sync_cache_with_secrets(
+    out_path: &Path,
+    schemas: Option<&[String]>,
+    db_url: &str,
+    cache_key: Option<&[u8; 32]>,
+) -> Result<()> {
+    let mut client = connect_database(db_url)?;
+    let cache = populate_cache(&mut client, schemas)?;
+    match cache_key {
+        Some(key) => write_cache_with_key(out_path, cache, key),
+        None => write_cache(out_path, cache, false),
+    }
+}
+
 fn connect_database(db_url: &str) -> Result<Client> {
-    let mut config: PostgresConfig = db_url
+    let mut config = parse_database_config(db_url)?;
+
+    apply_connection_safety_defaults(&mut config);
+
+    config
+        .connect(NoTls)
+        .context("Failed to connect to PostgreSQL")
+}
+
+fn parse_database_config(db_url: &str) -> Result<PostgresConfig> {
+    if db_url.trim().is_empty() {
+        anyhow::bail!("PostgreSQL connection string must not be empty or whitespace");
+    }
+    let config: PostgresConfig = db_url
         .parse()
-        .context("DATABASE_URL is not a valid PostgreSQL connection string")?;
+        .context("Invalid PostgreSQL connection string")?;
 
     if !database_config_is_local(&config) {
         anyhow::bail!(
@@ -56,11 +100,7 @@ fn connect_database(db_url: &str) -> Result<Client> {
         );
     }
 
-    apply_connection_safety_defaults(&mut config);
-
-    config
-        .connect(NoTls)
-        .context("Failed to connect to PostgreSQL")
+    Ok(config)
 }
 
 fn apply_connection_safety_defaults(config: &mut PostgresConfig) {
@@ -196,6 +236,48 @@ fn persistence_from_pg(code: u8) -> Result<Persistence> {
     }
 }
 
+fn column_storage_from_pg(code: &str) -> Result<String> {
+    match code {
+        "p" => Ok("PLAIN".to_string()),
+        "e" => Ok("EXTERNAL".to_string()),
+        "x" => Ok("EXTENDED".to_string()),
+        "m" => Ok("MAIN".to_string()),
+        _ => anyhow::bail!("unknown pg_attribute.attstorage value '{code}'"),
+    }
+}
+
+fn column_compression_from_pg(code: Option<&str>) -> Result<Option<String>> {
+    match code {
+        None | Some("") | Some("\0") => Ok(None),
+        Some("p") => Ok(Some("pglz".to_string())),
+        Some("l") => Ok(Some("lz4".to_string())),
+        // PostgreSQL exposes named values on some drivers and releases; keep
+        // those canonical rather than rejecting an otherwise valid catalog.
+        Some("pglz") => Ok(Some("pglz".to_string())),
+        Some("lz4") => Ok(Some("lz4".to_string())),
+        Some(value) => anyhow::bail!("unknown pg_attribute.attcompression value '{value}'"),
+    }
+}
+
+pub(crate) fn catalog_options(
+    values: Option<Vec<String>>,
+    object: &str,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    let mut options = std::collections::BTreeMap::new();
+    for option in values.unwrap_or_default() {
+        let Some((key, value)) = option.split_once('=') else {
+            anyhow::bail!("PostgreSQL returned malformed {object} option '{option}'");
+        };
+        if key.is_empty() || value.is_empty() {
+            anyhow::bail!("PostgreSQL returned malformed {object} option '{option}'");
+        }
+        if options.insert(key.to_string(), value.to_string()).is_some() {
+            anyhow::bail!("PostgreSQL returned duplicate {object} option '{key}'");
+        }
+    }
+    Ok(options)
+}
+
 fn partition_strategy_from_pg(code: Option<&str>) -> Result<Option<String>> {
     match code {
         None => Ok(None),
@@ -249,6 +331,12 @@ fn write_cache(out_path: &Path, cache: DbCache, cache_encryption: bool) -> Resul
     })
 }
 
+fn write_cache_with_key(out_path: &Path, cache: DbCache, key: &[u8; 32]) -> Result<()> {
+    write_cache_with_protection(out_path, cache, |compressed| {
+        protect_cache_bytes_with_key(compressed, key)
+    })
+}
+
 fn write_cache_with_protection(
     out_path: &Path,
     cache: DbCache,
@@ -273,7 +361,7 @@ fn write_cache_with_protection_and_limits(
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("Refusing to write a semantically invalid Cache V7 baseline")?;
+        .context("Refusing to write a semantically invalid Cache V8 baseline")?;
     let parent = cache_parent(out_path);
     let mut temp_file = NamedTempFile::new_in(parent).with_context(|| {
         format!(
@@ -286,17 +374,17 @@ fn write_cache_with_protection_and_limits(
         .context("Failed to init zstd compression")?;
     let mut encoder = SizeLimitedWriter::new(encoder, max_decode_bytes);
 
-    if let Err(error) = encoder.write_all(CACHE_V7_MAGIC) {
+    if let Err(error) = encoder.write_all(CACHE_V8_MAGIC) {
         if encoder.limit_exceeded() {
             anyhow::bail!(
                 "Cache payload exceeds the {} MiB decoded-size limit",
                 max_decode_bytes / (1024 * 1024)
             );
         }
-        return Err(error).context("Failed to write cache V7 payload header");
+        return Err(error).context("Failed to write cache V8 payload header");
     }
 
-    let versioned = DbCacheVersioned::V7(Box::new(cache));
+    let versioned = DbCacheVersioned::V8(Box::new(cache));
     let bincode_config = bincode::config::standard().with_variable_int_encoding();
 
     let encode_result =
@@ -477,7 +565,7 @@ fn replace_cache(temp_file: NamedTempFile, out_path: &Path) -> Result<()> {
     }
 }
 
-pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
+pub(crate) fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result<DbCache> {
     let mut transaction = client
         .build_transaction()
         .isolation_level(IsolationLevel::RepeatableRead)
@@ -492,7 +580,8 @@ pub fn populate_cache(client: &mut Client, schemas: Option<&[String]>) -> Result
 }
 
 #[doc(hidden)]
-pub fn populate_cache_in_current_transaction(
+#[cfg(test)]
+pub(crate) fn populate_cache_in_current_transaction(
     client: &mut Client,
     schemas: Option<&[String]>,
 ) -> Result<DbCache> {
@@ -567,6 +656,133 @@ fn load_view_dependencies(
 /// explicit schema boundary. The query covers the catalog classes that can
 /// expose a dependent relation (relations/indexes, constraints, rewrites,
 /// defaults, and triggers); unscoped synchronization needs no boundary list.
+fn load_scoped_external_index_dependencies(
+    client: &mut impl GenericClient,
+    schema_values: &Option<Vec<String>>,
+) -> Result<Vec<ObjectId>> {
+    let Some(schemas) = schema_values else {
+        return Ok(Vec::new());
+    };
+    if schemas.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query = r#"
+        SELECT DISTINCT ref_n.nspname AS ref_schema, ref_c.relname AS ref_name
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_class dep_c ON d.classid = 'pg_class'::regclass
+                           AND d.objid = dep_c.oid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_constraint dep_con ON d.classid = 'pg_constraint'::regclass
+                                  AND d.objid = dep_con.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_con.conrelid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_rewrite dep_rw ON d.classid = 'pg_rewrite'::regclass
+                              AND d.objid = dep_rw.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_rw.ev_class
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_attrdef dep_ad ON d.classid = 'pg_attrdef'::regclass
+                              AND d.objid = dep_ad.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_ad.adrelid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_trigger dep_tg ON d.classid = 'pg_trigger'::regclass
+                              AND d.objid = dep_tg.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_tg.tgrelid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_proc dep_p ON d.classid = 'pg_proc'::regclass
+                          AND d.objid = dep_p.oid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_p.pronamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+        UNION
+        SELECT DISTINCT ref_n.nspname, ref_c.relname
+        FROM pg_depend d
+        JOIN pg_class ref_c ON d.refclassid = 'pg_class'::regclass
+                           AND d.refobjid = ref_c.oid
+        JOIN pg_namespace ref_n ON ref_n.oid = ref_c.relnamespace
+        JOIN pg_policy dep_pol ON d.classid = 'pg_policy'::regclass
+                              AND d.objid = dep_pol.oid
+        JOIN pg_class dep_c ON dep_c.oid = dep_pol.polrelid
+        JOIN pg_namespace dep_n ON dep_n.oid = dep_c.relnamespace
+        WHERE ref_c.relkind IN ('i', 'I')
+          AND ref_n.nspname = ANY($1)
+          AND NOT (dep_n.nspname = ANY($1))
+          AND dep_n.nspname NOT LIKE 'pg\_%' ESCAPE '\'
+          AND dep_n.nspname <> 'information_schema'
+    "#;
+    client
+        .query(query, &[schemas])
+        .context("Failed to load scoped index dependency boundaries")?
+        .into_iter()
+        .map(|row| {
+            Ok(ObjectId::new(
+                row.try_get::<_, String>("ref_schema")?,
+                row.try_get::<_, String>("ref_name")?,
+            ))
+        })
+        .collect()
+}
+
 fn load_scoped_external_relation_dependencies(
     client: &mut impl GenericClient,
     schema_values: &Option<Vec<String>>,
@@ -1006,6 +1222,10 @@ fn load_roles(
     let memberships = client
         .query(membership_query, &[])
         .context("Failed to load role memberships from pg_auth_members")?;
+    // PostgreSQL 16+ may store several rows for the same (member, role) pair,
+    // one per grantor.  The effective projection is the union of their
+    // options, so aggregate rows instead of duplicating the edge.
+    let mut seen_edges = std::collections::HashSet::new();
     for row in memberships {
         let member = ObjectId::new("", row.try_get::<_, String>(0).context("member role")?);
         let parent = ObjectId::new("", row.try_get::<_, String>(1).context("parent role")?);
@@ -1013,15 +1233,27 @@ fn load_roles(
         let inherit_option: bool = row.try_get(3).context("role membership INHERIT option")?;
         let set_option: bool = row.try_get(4).context("role membership SET option")?;
         if let Some(role) = roles.get_mut(&member) {
-            role.member_of.push(parent.clone());
-            if admin_option {
-                role.can_administer_membership.push(parent.clone());
-            }
-            if inherit_option {
-                role.can_inherit_from.push(parent.clone());
-            }
-            if set_option {
-                role.can_set_role_to.push(parent);
+            if seen_edges.insert((member, parent.clone())) {
+                role.member_of.push(parent.clone());
+                if admin_option {
+                    role.can_administer_membership.push(parent.clone());
+                }
+                if inherit_option {
+                    role.can_inherit_from.push(parent.clone());
+                }
+                if set_option {
+                    role.can_set_role_to.push(parent.clone());
+                }
+            } else {
+                if admin_option && !role.can_administer_membership.contains(&parent) {
+                    role.can_administer_membership.push(parent.clone());
+                }
+                if inherit_option && !role.can_inherit_from.contains(&parent) {
+                    role.can_inherit_from.push(parent.clone());
+                }
+                if set_option && !role.can_set_role_to.contains(&parent) {
+                    role.can_set_role_to.push(parent);
+                }
             }
         }
     }
@@ -1030,17 +1262,29 @@ fn load_roles(
 
 fn load_role_membership_grantors(
     client: &mut impl GenericClient,
+    pg_version_num: u32,
 ) -> Result<Vec<crate::_internal::model::role::RoleMembershipGrantor>> {
+    let query = if pg_version_num >= 160_000 {
+        "SELECT member.rolname, parent.rolname, grantor.rolname,
+                membership.admin_option, membership.inherit_option,
+                membership.set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid
+         JOIN pg_roles grantor ON grantor.oid = membership.grantor
+         ORDER BY member.rolname, parent.rolname, grantor.rolname;"
+    } else {
+        "SELECT member.rolname, parent.rolname, grantor.rolname,
+                membership.admin_option, true AS inherit_option,
+                true AS set_option
+         FROM pg_auth_members membership
+         JOIN pg_roles member ON member.oid = membership.member
+         JOIN pg_roles parent ON parent.oid = membership.roleid
+         JOIN pg_roles grantor ON grantor.oid = membership.grantor
+         ORDER BY member.rolname, parent.rolname, grantor.rolname;"
+    };
     let rows = client
-        .query(
-            "SELECT member.rolname, parent.rolname, grantor.rolname
-             FROM pg_auth_members membership
-             JOIN pg_roles member ON member.oid = membership.member
-             JOIN pg_roles parent ON parent.oid = membership.roleid
-             JOIN pg_roles grantor ON grantor.oid = membership.grantor
-             ORDER BY member.rolname, parent.rolname, grantor.rolname;",
-            &[],
-        )
+        .query(query, &[])
         .context("Failed to load role membership grantors")?;
     rows.into_iter()
         .map(|row| {
@@ -1048,6 +1292,9 @@ fn load_role_membership_grantors(
                 member: ObjectId::new("", row.try_get::<_, String>(0)?),
                 role: ObjectId::new("", row.try_get::<_, String>(1)?),
                 grantor: ObjectId::new("", row.try_get::<_, String>(2)?),
+                admin: row.try_get(3)?,
+                inherit: row.try_get(4)?,
+                set: row.try_get(5)?,
             })
         })
         .collect()
@@ -1188,9 +1435,18 @@ fn load_sequences(
              d.deptype::text AS dependency_type,
              CASE WHEN ad.adbin IS NULL THEN false
                   ELSE pg_catalog.pg_get_expr(ad.adbin, ad.adrelid) LIKE '%nextval(%'
-             END AS has_nextval_default
+             END AS has_nextval_default,
+             pg_catalog.format_type(q.seqtypid, NULL) AS sequence_data_type,
+             q.seqstart AS sequence_start,
+             q.seqincrement AS sequence_increment,
+             q.seqmin AS sequence_min,
+             q.seqmax AS sequence_max,
+             q.seqcache AS sequence_cache,
+             q.seqcycle AS sequence_cycle,
+             s.relpersistence::text AS sequence_persistence
          FROM pg_class s
          JOIN pg_namespace n ON n.oid = s.relnamespace
+         JOIN pg_sequence q ON q.seqrelid = s.oid
          LEFT JOIN pg_depend d
            ON d.classid = 'pg_class'::regclass
           AND d.objid = s.oid
@@ -1234,6 +1490,15 @@ fn load_sequences(
                 .map(|((schema, table), column)| (ObjectId::new(schema, table), column));
             let kind = sequence_kind_from_pg(dependency_type.as_deref(), has_nextval_default)
                 .with_context(|| format!("sequence '{}' dependency kind", id))?;
+            let persistence: String = row
+                .try_get("sequence_persistence")
+                .context("sequence persistence")?;
+            let persistence = match persistence.as_str() {
+                "p" => crate::_internal::model::sequence::SequencePersistence::Permanent,
+                "t" => crate::_internal::model::sequence::SequencePersistence::Temporary,
+                "u" => crate::_internal::model::sequence::SequencePersistence::Unlogged,
+                other => anyhow::bail!("unsupported sequence persistence code '{other}'"),
+            };
             Ok((
                 id.clone(),
                 crate::_internal::model::sequence::SequenceState {
@@ -1241,6 +1506,20 @@ fn load_sequences(
                     owner,
                     owned_by,
                     kind,
+                    parameters: crate::_internal::model::sequence::SequenceParameters {
+                        data_type: row
+                            .try_get("sequence_data_type")
+                            .context("sequence data type")?,
+                        start_value: row.try_get("sequence_start").context("sequence start")?,
+                        increment: row
+                            .try_get("sequence_increment")
+                            .context("sequence increment")?,
+                        min_value: row.try_get("sequence_min").context("sequence minimum")?,
+                        max_value: row.try_get("sequence_max").context("sequence maximum")?,
+                        cache_size: row.try_get("sequence_cache").context("sequence cache")?,
+                        cycle: row.try_get("sequence_cycle").context("sequence cycle")?,
+                        persistence,
+                    },
                     generation: 0,
                 },
             ))
@@ -1261,15 +1540,44 @@ fn load_relations_and_columns(
             c.relname AS relation_name,
             c.relkind AS relation_kind,
             c.relpersistence AS persistence,
+            c.relrowsecurity AS row_security,
+            c.relforcerowsecurity AS force_row_security,
+            CASE c.relreplident
+                WHEN 'd' THEN 'DEFAULT'
+                WHEN 'n' THEN 'NOTHING'
+                WHEN 'f' THEN 'FULL'
+                WHEN 'i' THEN CASE
+                    WHEN replica_index.relname IS NULL THEN 'USING INDEX'
+                    ELSE 'USING INDEX ' || replica_index.relname
+                END
+                ELSE NULL
+            END AS replica_identity,
+            type_namespace.nspname AS typed_table_type_schema,
+            table_type.typname AS typed_table_type_name,
+            c.reloptions AS relation_options,
+            ts.spcname AS tablespace,
+            am.amname AS access_method,
+            cluster_index.relname AS cluster_index,
             pg_catalog.pg_get_userbyid(c.relowner) AS owner_name,
             CASE WHEN c.reltuples < 0 THEN -1 ELSE c.reltuples::bigint END AS estimated_rows,
             c.relpages::bigint AS relpages,
             to_char(s.last_analyze, 'YYYY-MM-DD HH24:MI:SS') AS last_analyze,
             to_char(s.last_autoanalyze, 'YYYY-MM-DD HH24:MI:SS') AS last_autoanalyze,
             p.partstrat::text AS partition_strategy,
+            pg_catalog.pg_get_partkeydef(c.oid) AS partition_key,
+            pg_catalog.pg_get_expr(c.relpartbound, c.oid) AS partition_bound,
+            pg_catalog.pg_get_partition_constraintdef(c.oid) AS partition_constraint,
             CASE WHEN c.relkind = 'm' THEN c.relispopulated ELSE NULL END AS is_populated
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
+        LEFT JOIN pg_tablespace ts ON ts.oid = c.reltablespace
+        LEFT JOIN pg_am am ON am.oid = c.relam
+        LEFT JOIN pg_type table_type ON table_type.oid = c.reloftype
+        LEFT JOIN pg_namespace type_namespace ON type_namespace.oid = table_type.typnamespace
+        LEFT JOIN pg_index cluster_i ON cluster_i.indrelid = c.oid AND cluster_i.indisclustered
+        LEFT JOIN pg_class cluster_index ON cluster_index.oid = cluster_i.indexrelid
+        LEFT JOIN pg_index replica_i ON replica_i.indrelid = c.oid AND replica_i.indisreplident
+        LEFT JOIN pg_class replica_index ON replica_index.oid = replica_i.indexrelid
         LEFT JOIN pg_stat_user_tables s ON s.relid = c.oid
         LEFT JOIN pg_partitioned_table p ON p.partrelid = c.oid
         WHERE c.relkind IN ('r', 'p', 'v', 'm')
@@ -1286,6 +1594,32 @@ fn load_relations_and_columns(
         let relation_name: String = row.try_get("relation_name").context("relation name")?;
         let relkind: i8 = row.try_get("relation_kind").context("relation kind")?;
         let persistence_char: i8 = row.try_get("persistence").context("relation persistence")?;
+        let row_security: bool = row
+            .try_get("row_security")
+            .context("relation row security")?;
+        let force_row_security: bool = row
+            .try_get("force_row_security")
+            .context("relation forced row security")?;
+        let replica_identity: Option<String> = row
+            .try_get("replica_identity")
+            .context("relation replica identity")?;
+        let typed_table_type_schema: Option<String> = row
+            .try_get("typed_table_type_schema")
+            .context("typed-table type schema")?;
+        let typed_table_type_name: Option<String> = row
+            .try_get("typed_table_type_name")
+            .context("typed-table type name")?;
+        let relation_options: Option<Vec<String>> = row
+            .try_get("relation_options")
+            .context("relation options")?;
+        let tablespace: Option<String> =
+            row.try_get("tablespace").context("relation tablespace")?;
+        let access_method: Option<String> = row
+            .try_get("access_method")
+            .context("relation access method")?;
+        let cluster_index: Option<String> = row
+            .try_get("cluster_index")
+            .context("relation cluster index")?;
         let owner_name: String = row.try_get("owner_name").context("relation owner")?;
         let raw_rows: i64 = row
             .try_get("estimated_rows")
@@ -1333,6 +1667,24 @@ fn load_relations_and_columns(
         state.partition_type = partition_strategy_from_pg(partition_strategy.as_deref())
             .with_context(|| format!("relation '{}' partition strategy", object_id))?;
         state.is_populated = is_populated;
+        state.partition_by = row
+            .try_get::<_, Option<String>>("partition_key")?
+            .map(|key| format!("PARTITION BY {key}"));
+        state.partition_bound = row.try_get("partition_bound")?;
+        state.partition_constraint = row.try_get("partition_constraint")?;
+        state.row_security = Some(row_security);
+        state.force_row_security = Some(force_row_security);
+        state.replica_identity = replica_identity;
+        state.of_type = match (typed_table_type_schema, typed_table_type_name) {
+            (Some(schema), Some(name)) => Some(ObjectId::new(schema, name)),
+            (None, None) => None,
+            _ => anyhow::bail!("PostgreSQL returned incomplete typed-table type identity"),
+        };
+        state.table_options = catalog_options(relation_options, "relation")
+            .with_context(|| format!("relation '{}' options", object_id))?;
+        state.tablespace = tablespace;
+        state.access_method = access_method;
+        state.cluster_index = cluster_index;
         if let Some(scoped_schemas) = schemas
             && !scoped_schemas.contains(&schema_name)
         {
@@ -1347,12 +1699,26 @@ fn load_relations_and_columns(
             n.nspname AS schema_name,
             c.relname AS relation_name,
             a.attname AS column_name,
-            pg_catalog.format_type(a.atttypid, a.atttypmod) AS type_name,
+            CASE WHEN type_ns.nspname <> 'pg_catalog'
+                       AND pg_catalog.pg_type_is_visible(a.atttypid)
+                 THEN quote_ident(type_ns.nspname) || '.' || pg_catalog.format_type(a.atttypid, a.atttypmod)
+                 ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+            END AS type_name,
             a.attnotnull AS not_null,
             s.avg_width AS avg_width,
             pg_get_expr(ad.adbin, ad.adrelid) AS default_expr_text,
-            a.atttypmod AS type_modifier
+            a.atttypmod AS type_modifier,
+            a.attstorage::text AS storage,
+            NULLIF(a.attcompression::text, '') AS compression,
+            a.attstattarget::integer AS statistics_target,
+            a.attoptions AS column_options,
+            a.attinhcount::integer AS inheritance_count,
+            a.attislocal AS is_local,
+            NULLIF(a.attgenerated::text, '') AS generated_kind,
+            NULLIF(a.attidentity::text, '') AS identity_generation
         FROM pg_attribute a
+        JOIN pg_type column_type ON column_type.oid = a.atttypid
+        JOIN pg_namespace type_ns ON type_ns.oid = column_type.typnamespace
         JOIN pg_class c ON a.attrelid = c.oid
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_stats s ON s.schemaname = n.nspname AND s.tablename = c.relname AND s.attname = a.attname
@@ -1380,10 +1746,61 @@ fn load_relations_and_columns(
                 relation_id
             )
         })?;
+        let column_name: String = row.try_get("column_name").context("column name")?;
+        let identity_generation: Option<String> = row
+            .try_get("identity_generation")
+            .context("column identity generation")?;
+        if let Some(code) = identity_generation {
+            let mut chars = code.chars();
+            let generation = chars
+                .next()
+                .filter(|_| chars.next().is_none())
+                .and_then(crate::_internal::model::relation::IdentityGeneration::from_pg_code)
+                .with_context(|| {
+                    format!(
+                        "column '{}.{}' identity generation",
+                        relation_id, column_name
+                    )
+                })?;
+            relation
+                .identity_columns
+                .insert(column_name.clone(), generation);
+        }
+        let generated_kind: Option<String> = row
+            .try_get("generated_kind")
+            .context("column generated kind")?;
+        let expression_text: Option<String> = row
+            .try_get("default_expr_text")
+            .context("column expression")?;
+        if let Some(code) = generated_kind.as_deref() {
+            let mut chars = code.chars();
+            let kind = chars
+                .next()
+                .filter(|_| chars.next().is_none())
+                .and_then(crate::_internal::model::relation::GeneratedColumnKind::from_pg_code)
+                .with_context(|| {
+                    format!("column '{}.{}' generated kind", relation_id, column_name)
+                })?;
+            relation.generated_columns.insert(
+                column_name.clone(),
+                crate::_internal::model::relation::GeneratedColumnState {
+                    kind,
+                    expression: expression_text.clone(),
+                },
+            );
+        }
+        relation.column_inheritance.insert(
+            column_name.clone(),
+            crate::_internal::model::relation::ColumnInheritance {
+                parent_count: u32::try_from(row.try_get::<_, i32>("inheritance_count")?)
+                    .context("negative column inheritance count")?,
+                is_local: row.try_get("is_local")?,
+            },
+        );
         relation
             .columns
             .push(crate::_internal::model::column::Column {
-                name: row.try_get("column_name").context("column name")?,
+                name: column_name,
                 data_type: Some(row.try_get("type_name").context("column type")?),
                 type_id: None,
                 is_nullable: !row
@@ -1391,13 +1808,113 @@ fn load_relations_and_columns(
                     .context("column nullability")?,
                 default: None,
                 avg_width: row.try_get("avg_width").context("column average width")?,
-                default_expr_text: row
-                    .try_get("default_expr_text")
-                    .context("column default expression")?,
+                default_expr_text: generated_kind
+                    .is_none()
+                    .then_some(expression_text)
+                    .flatten(),
                 type_modifier: row
                     .try_get("type_modifier")
                     .context("column type modifier")?,
+                storage: column_storage_from_pg(
+                    &row.try_get::<_, String>("storage")
+                        .context("column storage")?,
+                )
+                .context("column storage")
+                .map(Some)?,
+                compression: column_compression_from_pg(
+                    row.try_get::<_, Option<String>>("compression")
+                        .context("column compression")?
+                        .as_deref(),
+                )
+                .context("column compression")?,
+                statistics_target: row
+                    .try_get("statistics_target")
+                    .context("column statistics target")?,
+                options: catalog_options(
+                    row.try_get("column_options").context("column options")?,
+                    "column",
+                )
+                .with_context(|| format!("column options on relation '{}'", relation_id))?,
+                generated: Some(generated_kind.is_some()),
             });
+    }
+
+    let statistics_query = format!(
+        "
+        SELECT
+            n.nspname AS table_schema,
+            c.relname AS table_name,
+            stats_ns.nspname AS statistics_schema,
+            stats.stxname AS statistics_name,
+            ARRAY(SELECT kind::text FROM unnest(stats.stxkind) AS kind) AS kinds,
+            ARRAY(
+                SELECT attribute.attname
+                FROM (
+                    SELECT key.attnum
+                    FROM unnest(stats.stxkeys::smallint[]) AS key(attnum)
+                    UNION
+                    SELECT dependency.refobjsubid::smallint
+                    FROM pg_depend dependency
+                    WHERE dependency.classid = 'pg_statistic_ext'::regclass
+                      AND dependency.objid = stats.oid
+                      AND dependency.refclassid = 'pg_class'::regclass
+                      AND dependency.refobjid = stats.stxrelid
+                      AND dependency.refobjsubid > 0
+                ) AS key
+                JOIN pg_attribute attribute
+                  ON attribute.attrelid = stats.stxrelid
+                 AND attribute.attnum = key.attnum
+                ORDER BY attribute.attname
+            ) AS columns,
+            pg_get_expr(stats.stxexprs, stats.stxrelid, false) AS expressions,
+            stats.stxstattarget::integer AS statistics_target
+        FROM pg_statistic_ext stats
+        JOIN pg_class c ON c.oid = stats.stxrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        JOIN pg_namespace stats_ns ON stats_ns.oid = stats.stxnamespace
+        WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
+          {schema_filter_with_fk}
+        ORDER BY stats_ns.nspname, stats.stxname;
+        "
+    );
+    for row in client
+        .query(&statistics_query, &[schema_values])
+        .context("Failed to load extended statistics from pg_statistic_ext")?
+    {
+        let relation_id = ObjectId::new(
+            row.try_get::<_, String>("table_schema")
+                .context("extended statistics table schema")?,
+            row.try_get::<_, String>("table_name")
+                .context("extended statistics table name")?,
+        );
+        let statistics_id = ObjectId::new(
+            row.try_get::<_, String>("statistics_schema")
+                .context("extended statistics schema")?,
+            row.try_get::<_, String>("statistics_name")
+                .context("extended statistics name")?,
+        );
+        let relation = relations.get_mut(&relation_id).with_context(|| {
+            format!(
+                "extended statistics '{}' reference omitted relation '{}'",
+                statistics_id, relation_id
+            )
+        })?;
+        relation.extended_statistics.insert(
+            statistics_id.clone(),
+            crate::_internal::model::relation::ExtendedStatisticsState {
+                id: statistics_id,
+                kinds: row.try_get("kinds").context("extended statistics kinds")?,
+                columns: row
+                    .try_get("columns")
+                    .context("extended statistics columns")?,
+                expressions: row
+                    .try_get("expressions")
+                    .context("extended statistics expressions")?,
+                target: row
+                    .try_get("statistics_target")
+                    .context("extended statistics target")?,
+            },
+        );
     }
     Ok(relations)
 }
@@ -1406,6 +1923,7 @@ struct RelationDecoration {
     relation_id: ObjectId,
     triggers: Vec<String>,
     policies: Vec<String>,
+    rules: std::collections::HashMap<String, crate::_internal::model::relation::RuleEnableMode>,
 }
 
 struct RelationGrant {
@@ -1427,14 +1945,26 @@ fn load_relation_decorations(
             n.nspname AS schema_name,
             c.relname AS relation_name,
             COALESCE(array_agg(DISTINCT t.tgname) FILTER (WHERE t.tgname IS NOT NULL AND t.tgisinternal = false), '{{}}') as triggers,
-            COALESCE(array_agg(DISTINCT p.polname) FILTER (WHERE p.polname IS NOT NULL), '{{}}') as policies
+            COALESCE(array_agg(DISTINCT p.polname) FILTER (WHERE p.polname IS NOT NULL), '{{}}') as policies,
+            ARRAY(
+                SELECT r.rulename
+                FROM pg_rewrite r
+                WHERE r.ev_class = c.oid AND r.rulename <> '_RETURN'
+                ORDER BY r.oid
+            ) AS rule_names,
+            ARRAY(
+                SELECT r.ev_enabled::text
+                FROM pg_rewrite r
+                WHERE r.ev_class = c.oid AND r.rulename <> '_RETURN'
+                ORDER BY r.oid
+            ) AS rule_modes
         FROM pg_class c
         JOIN pg_namespace n ON n.oid = c.relnamespace
         LEFT JOIN pg_trigger t ON t.tgrelid = c.oid
         LEFT JOIN pg_policy p ON p.polrelid = c.oid
         WHERE c.relkind IN ('r', 'p', 'v', 'm') AND n.nspname NOT IN ('pg_catalog', 'information_schema')
         {schema_filter_with_fk}
-        GROUP BY n.nspname, c.relname;
+        GROUP BY n.nspname, c.relname, c.oid;
     "
     );
     let decorations = client
@@ -1442,6 +1972,25 @@ fn load_relation_decorations(
         .context("Failed to load relation triggers and policies")?
         .into_iter()
         .map(|row| {
+            let rule_names: Vec<String> = row.try_get("rule_names").context("relation rules")?;
+            let rule_modes: Vec<String> =
+                row.try_get("rule_modes").context("relation rule modes")?;
+            if rule_names.len() != rule_modes.len() {
+                anyhow::bail!("PostgreSQL returned mismatched relation rule metadata");
+            }
+            let rules = rule_names
+                .into_iter()
+                .zip(rule_modes)
+                .map(|(name, code)| {
+                    let mut chars = code.chars();
+                    let mode = chars
+                        .next()
+                        .filter(|_| chars.next().is_none())
+                        .and_then(crate::_internal::model::relation::RuleEnableMode::from_pg_code)
+                        .with_context(|| format!("rule '{name}' enable mode"))?;
+                    Ok((name, mode))
+                })
+                .collect::<Result<std::collections::HashMap<_, _>>>()?;
             Ok(RelationDecoration {
                 relation_id: ObjectId::new(
                     row.try_get::<_, String>("schema_name")
@@ -1451,6 +2000,7 @@ fn load_relation_decorations(
                 ),
                 triggers: row.try_get("triggers").context("relation trigger names")?,
                 policies: row.try_get("policies").context("relation policy names")?,
+                rules,
             })
         })
         .collect::<Result<Vec<_>>>()?;
@@ -1534,6 +2084,10 @@ fn load_triggers(
             c.relname AS table_name,
             t.tgname AS trigger_name,
             t.tgenabled::text AS enabled_mode,
+            (t.tgtype & 1) <> 0 AS row_level,
+            COALESCE(pn.nspname, inferred_pn.nspname) AS parent_table_schema,
+            COALESCE(pc.relname, inferred_pc.relname) AS parent_table_name,
+            COALESCE(pt.tgname, inferred_pt.tgname) AS parent_trigger_name,
             fn.nspname AS function_schema,
             f.proname || '()' AS function_name
         FROM pg_trigger t
@@ -1541,7 +2095,33 @@ fn load_triggers(
         JOIN pg_namespace n ON n.oid = c.relnamespace
         JOIN pg_proc f ON f.oid = t.tgfoid
         JOIN pg_namespace fn ON fn.oid = f.pronamespace
-        WHERE t.tgisinternal = false
+        LEFT JOIN pg_trigger pt ON pt.oid = t.tgparentid
+        LEFT JOIN pg_class pc ON pc.oid = pt.tgrelid
+        LEFT JOIN pg_namespace pn ON pn.oid = pc.relnamespace
+        LEFT JOIN LATERAL (
+            SELECT parent_t.oid AS trigger_oid,
+                   parent_c.oid AS table_oid,
+                   parent_c.relname,
+                   parent_n.nspname,
+                   parent_t.tgname
+            FROM pg_inherits inheritance
+            JOIN pg_trigger parent_t
+              ON parent_t.tgrelid = inheritance.inhparent
+             AND parent_t.tgname = t.tgname
+             AND parent_t.tgisinternal = false
+            JOIN pg_class parent_c ON parent_c.oid = parent_t.tgrelid
+            JOIN pg_namespace parent_n ON parent_n.oid = parent_c.relnamespace
+            WHERE inheritance.inhrelid = t.tgrelid
+            -- A cloned trigger normally keeps the same function OID.  Older
+            -- PostgreSQL releases have catalog cases where that linkage is
+            -- not stable, so prefer an exact function match but retain the
+            -- unique parent/name relationship as a compatibility fallback.
+            ORDER BY (parent_t.tgfoid = t.tgfoid) DESC, parent_t.oid
+            LIMIT 1
+        ) inferred_pt ON true
+        LEFT JOIN pg_class inferred_pc ON inferred_pc.oid = inferred_pt.table_oid
+        LEFT JOIN pg_namespace inferred_pn ON inferred_pn.oid = inferred_pc.relnamespace
+        WHERE (t.tgisinternal = false OR (t.tgparentid <> 0 AND pt.tgisinternal = false))
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk};
@@ -1573,6 +2153,21 @@ fn load_triggers(
                     row.try_get::<_, String>("function_name")
                         .context("trigger function name")?,
                 ),
+                row_level: row.try_get("row_level").context("trigger level")?,
+                parent_trigger_id: match (
+                    row.try_get::<_, Option<String>>("parent_table_schema")
+                        .context("parent trigger table schema")?,
+                    row.try_get::<_, Option<String>>("parent_table_name")
+                        .context("parent trigger table name")?,
+                    row.try_get::<_, Option<String>>("parent_trigger_name")
+                        .context("parent trigger name")?,
+                ) {
+                    (Some(schema), Some(table), Some(name)) => {
+                        Some(ObjectId::new(schema, format!("{table}\0{name}")))
+                    }
+                    (None, None, None) => None,
+                    _ => anyhow::bail!("PostgreSQL returned incomplete parent trigger identity"),
+                },
                 enabled_mode: crate::_internal::model::trigger::TriggerEnableMode::from_pg_code(
                     &enabled_mode,
                 )
@@ -1597,6 +2192,10 @@ fn load_constraints(
             con.conname AS constraint_name,
             con.contype::text AS constraint_type,
             con.convalidated AS validated,
+            CASE WHEN con.contype = 'c'
+                 THEN pg_get_expr(con.conbin, con.conrelid, false)
+                 ELSE NULL
+            END AS definition,
             NULLIF(backing_n.nspname, '') AS backing_index_schema,
             NULLIF(backing.relname, '') AS backing_index_name
         FROM pg_constraint con
@@ -1631,7 +2230,7 @@ fn load_constraints(
             // foreign key stores the referenced key index.  ConstraintState's
             // backing index is intentionally only the former; retaining the
             // FK's referenced index here would make a valid cross-table cache
-            // look internally inconsistent during V7 validation.
+            // look internally inconsistent during V8 validation.
             let backing_index = if matches!(
                 kind,
                 crate::_internal::model::constraint::ConstraintKind::PrimaryKey
@@ -1660,6 +2259,7 @@ fn load_constraints(
                 validated: row
                     .try_get("validated")
                     .context("constraint validation state")?,
+                definition: row.try_get("definition").context("constraint definition")?,
                 backing_index,
             })
         })
@@ -1732,19 +2332,29 @@ fn load_constraint_dependencies(
             c.relname AS table_name,
             con.conname AS constraint_name,
             ARRAY(
-                SELECT DISTINCT a.attname
-                FROM pg_depend d
-                JOIN pg_attribute a
-                  ON a.attrelid = d.refobjid
-                 AND a.attnum = d.refobjsubid
-                 AND NOT a.attisdropped
-                WHERE d.classid = 'pg_constraint'::regclass
-                  AND d.objid = con.oid
-                  AND d.refclassid = 'pg_class'::regclass
-                  AND d.refobjid = con.conrelid
-                  AND d.refobjsubid > 0
-                  AND d.deptype = 'n'
-                ORDER BY a.attname
+                SELECT DISTINCT names.attname
+                FROM (
+                    SELECT a.attname
+                    FROM pg_depend d
+                    JOIN pg_attribute a
+                      ON a.attrelid = d.refobjid
+                     AND a.attnum = d.refobjsubid
+                     AND NOT a.attisdropped
+                    WHERE d.classid = 'pg_constraint'::regclass
+                      AND d.objid = con.oid
+                      AND d.refclassid = 'pg_class'::regclass
+                      AND d.refobjid = con.conrelid
+                      AND d.refobjsubid > 0
+                      AND d.deptype = 'n'
+                    UNION ALL
+                    SELECT a.attname
+                    FROM unnest(con.conkey) AS key(attnum)
+                    JOIN pg_attribute a
+                      ON a.attrelid = con.conrelid
+                     AND a.attnum = key.attnum
+                     AND NOT a.attisdropped
+                ) AS names
+                ORDER BY names.attname
             ) AS dependency_columns
         FROM pg_constraint con
         JOIN pg_class c ON c.oid = con.conrelid
@@ -2103,6 +2713,7 @@ fn load_indexes(
             x.indisready AS is_ready,
             x.indislive AS is_live,
             x.indisunique AS is_unique,
+            x.indimmediate AS is_immediate,
             x.indpred IS NOT NULL AS has_predicate,
             ARRAY(
                 SELECT a.attname
@@ -2236,6 +2847,9 @@ fn load_indexes(
             has_expression_keys,
             has_predicate,
             is_unique: row.try_get("is_unique").context("index uniqueness flag")?,
+            is_immediate: row
+                .try_get("is_immediate")
+                .context("index immediacy flag")?,
             is_valid: row.try_get("is_valid").context("index validity flag")?,
             is_ready: row.try_get("is_ready").context("index readiness flag")?,
             is_live: row.try_get("is_live").context("index liveness flag")?,
@@ -2354,12 +2968,28 @@ fn load_types(
                 array_agg(e.enumlabel ORDER BY e.enumsortorder)
                     FILTER (WHERE e.enumlabel IS NOT NULL),
                 ARRAY[]::text[]
-            ) AS enum_labels
+            ) AS enum_labels,
+            COALESCE(
+                array_agg(a.attname ORDER BY a.attnum)
+                    FILTER (WHERE a.attname IS NOT NULL),
+                ARRAY[]::text[]
+            ) AS composite_field_names,
+            COALESCE(
+                array_agg(pg_catalog.format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum)
+                    FILTER (WHERE a.attname IS NOT NULL),
+                ARRAY[]::text[]
+            ) AS composite_field_types
         FROM pg_type t
         JOIN pg_namespace n ON n.oid = t.typnamespace
         LEFT JOIN pg_enum e ON e.enumtypid = t.oid
+        LEFT JOIN pg_class composite_rel ON composite_rel.oid = t.typrelid
+        LEFT JOIN pg_attribute a
+          ON a.attrelid = t.typrelid
+         AND a.attnum > 0
+         AND NOT a.attisdropped
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
-          AND t.typtype IN ('e', 'd')
+          AND t.typtype IN ('e', 'd', 'c')
+          AND (t.typtype <> 'c' OR composite_rel.relkind = 'c')
           {schema_filter}
         GROUP BY n.nspname, t.typname, t.typtype, t.typbasetype, t.typtypmod;
         "
@@ -2381,6 +3011,29 @@ fn load_types(
                         .context("PostgreSQL omitted the base type for a domain")?,
                     base_type_id: None,
                 },
+                "c" => {
+                    let names: Vec<String> = row
+                        .try_get("composite_field_names")
+                        .context("composite field names")?;
+                    let data_types: Vec<String> = row
+                        .try_get("composite_field_types")
+                        .context("composite field types")?;
+                    if names.len() != data_types.len() {
+                        anyhow::bail!("PostgreSQL returned mismatched composite field metadata");
+                    }
+                    crate::_internal::model::types::TypeKind::Composite {
+                        fields: names
+                            .into_iter()
+                            .zip(data_types)
+                            .map(|(name, data_type)| {
+                                crate::_internal::model::types::CompositeFieldState {
+                                    name,
+                                    data_type,
+                                }
+                            })
+                            .collect(),
+                    }
+                }
                 other => anyhow::bail!("unsupported pg_type.typtype '{other}'"),
             };
             let id = ObjectId::new(
@@ -2868,6 +3521,7 @@ fn populate_cache_from_client(
             })?;
         relation.triggers.extend(decoration.triggers);
         relation.policies.extend(decoration.policies);
+        relation.rules.extend(decoration.rules);
     }
     for grant in relation_grants {
         let relation = cache
@@ -2919,7 +3573,7 @@ fn populate_cache_from_client(
 
     // Only view dependencies are consumed by cache hydration. Generic
     // pg_depend rows use PostgreSQL dependency codes (n/a/i) and were ignored
-    // after synchronization, so avoid loading them into Cache V7.
+    // after synchronization, so avoid loading them into Cache V8.
     cache.dependencies = load_view_dependencies(client, &schema_values)?;
     cache.scoped_external_relation_dependencies =
         load_scoped_external_relation_dependencies(client, &schema_values)?;
@@ -2927,6 +3581,8 @@ fn populate_cache_from_client(
         load_scoped_external_type_dependencies(client, &schema_values)?;
     cache.scoped_external_routine_dependencies =
         load_scoped_external_routine_dependencies(client, &schema_values)?;
+    cache.scoped_external_index_dependencies =
+        load_scoped_external_index_dependencies(client, &schema_values)?;
     // All scope-boundary queries above completed inside the same repeatable
     // read transaction. Mark this only after every query succeeds; a cache
     // that was assembled programmatically or by a partial loader remains
@@ -2937,13 +3593,26 @@ fn populate_cache_from_client(
     // `SET ROLE` from a migration that PostgreSQL would reject. pg_roles does
     // not expose password hashes or other credentials.
     cache.roles = load_roles(client, cache.pg_version_num.unwrap_or_default())?;
-    cache.role_membership_grantors = load_role_membership_grantors(client)?;
+    cache.role_membership_grantors =
+        load_role_membership_grantors(client, cache.pg_version_num.unwrap_or_default())?;
     cache.role_membership_grantors_complete = true;
+
+    // The bootstrap superuser (pg_authid OID 10, `BOOTSTRAP_SUPERUSERID`)
+    // receives implicit superuser-issued role grantor attribution on modern
+    // PostgreSQL.  Recording its name lets state resolution distinguish it
+    // from a session role when replaying unchecked GRANT statements.
+    cache.bootstrap_superuser = client
+        .query("SELECT rolname FROM pg_roles WHERE oid = 10;", &[])
+        .context("Failed to load the bootstrap superuser role")?
+        .first()
+        .map(|row| row.try_get::<_, String>(0))
+        .transpose()
+        .context("bootstrap superuser name")?;
 
     cache
         .validate_semantics()
         .map_err(anyhow::Error::msg)
-        .context("PostgreSQL catalogs produced a semantically invalid Cache V7 baseline")?;
+        .context("PostgreSQL catalogs produced a semantically invalid Cache V8 baseline")?;
     Ok(cache)
 }
 
@@ -3070,8 +3739,8 @@ mod atomic_write_tests {
         let mut payload = Vec::new();
         decoder.read_to_end(&mut payload).unwrap();
         let payload = payload
-            .strip_prefix(CACHE_V7_MAGIC)
-            .expect("writer must prefix V7 cache payloads");
+            .strip_prefix(CACHE_V8_MAGIC)
+            .expect("writer must prefix V8 cache payloads");
         let config = bincode::config::standard().with_variable_int_encoding();
         let versioned: DbCacheVersioned = bincode::serde::decode_from_slice(payload, config)
             .unwrap()
@@ -3166,7 +3835,7 @@ mod atomic_write_tests {
             DbCache::new(),
             Ok,
             MAX_CACHE_FILE_BYTES,
-            CACHE_V7_MAGIC.len(),
+            CACHE_V8_MAGIC.len(),
         )
         .unwrap_err();
 

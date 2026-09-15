@@ -13,7 +13,7 @@ mod sequence;
 mod session;
 mod types;
 
-pub struct Resolver;
+pub(crate) struct Resolver;
 
 impl Resolver {
     fn resolve_creation_name(name: &QualifiedName, state: &AnalysisState) -> ObjectId {
@@ -182,7 +182,7 @@ impl Resolver {
         folded
     }
 
-    pub fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
+    pub(crate) fn resolve(fact: &StatementFact, state: &AnalysisState) -> Vec<Mutation> {
         let mut mutations = Vec::new();
         match fact {
             StatementFact::CreateSchema {
@@ -212,24 +212,40 @@ impl Resolver {
                 if_not_exists,
                 as_select,
                 persistence,
+                on_commit,
                 columns,
                 foreign_keys,
                 table_constraints,
                 partition_by,
+                partition_strategy,
                 partition_of,
-                partition_type,
+                partition_bound,
+                inherits,
+                like_sources,
+                of_type,
+                select_source,
+                select_outputs,
+                select_projection_complete,
             } => {
                 mutations.push(Self::resolve_create_table(
                     name,
                     *if_not_exists,
                     *as_select,
                     persistence,
+                    *on_commit,
                     columns,
                     foreign_keys,
                     table_constraints,
                     partition_by,
+                    partition_strategy,
                     partition_of,
-                    partition_type,
+                    partition_bound,
+                    inherits,
+                    like_sources,
+                    of_type,
+                    select_source,
+                    select_outputs,
+                    *select_projection_complete,
                     state,
                 ));
             }
@@ -328,8 +344,11 @@ impl Resolver {
                 name,
                 table,
                 function,
+                row_level,
             } => {
-                mutations.push(Self::resolve_create_trigger(name, table, function, state));
+                mutations.push(Self::resolve_create_trigger(
+                    name, table, function, *row_level, state,
+                ));
             }
             StatementFact::DropTrigger {
                 name,
@@ -378,11 +397,15 @@ impl Resolver {
                 name,
                 if_not_exists,
                 owned_by,
+                persistence,
+                options,
             } => {
                 mutations.push(Self::resolve_create_sequence(
                     name,
                     *if_not_exists,
                     owned_by,
+                    persistence,
+                    options,
                     state,
                 ));
             }
@@ -404,8 +427,12 @@ impl Resolver {
                     names, *if_exists, *cascade, state,
                 ));
             }
-            StatementFact::AlterTable { name, actions } => {
-                mutations.extend(Self::resolve_alter_table(name, actions, state));
+            StatementFact::AlterTable {
+                name,
+                only,
+                actions,
+            } => {
+                mutations.extend(Self::resolve_alter_table(name, *only, actions, state));
             }
             StatementFact::DropTable {
                 names,
@@ -444,6 +471,21 @@ impl Resolver {
                     state,
                 ));
             }
+            StatementFact::Lock {
+                targets,
+                mode,
+                nowait,
+            } => mutations.push(Self::resolve_lock(targets, *mode, *nowait, state)),
+            StatementFact::Truncate {
+                targets,
+                cascade,
+                restart_identity,
+            } => mutations.push(Self::resolve_truncate(
+                targets,
+                *cascade,
+                *restart_identity,
+                state,
+            )),
             StatementFact::SetSearchPath { target, local } => {
                 mutations.push(Self::resolve_search_path(target, *local))
             }

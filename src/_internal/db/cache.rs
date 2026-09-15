@@ -5,18 +5,18 @@ use crate::_internal::model::relation::{RelationKind, RelationState};
 use crate::_internal::model::replication::{PublicationState, SubscriptionState};
 use crate::_internal::model::role::{RoleMembershipGrantor, RoleState};
 use crate::_internal::model::schema::SchemaState;
-use crate::_internal::model::sequence::SequenceState;
+use crate::_internal::model::sequence::{SequenceKind, SequenceState};
 use crate::_internal::model::trigger::TriggerEnableMode;
-use crate::_internal::model::types::TypeState;
+use crate::_internal::model::types::{TypeKind, TypeState};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeSet, HashMap, HashSet};
 
 /// Catalog families whose completeness is independently meaningful to the
-/// analyzer. The V7 cache records this explicitly instead of treating one
+/// analyzer. The V8 cache records this explicitly instead of treating one
 /// optional schema list as evidence for every object class.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum CatalogFamily {
+pub(crate) enum CatalogFamily {
     Schemas,
     Relations,
     Sequences,
@@ -33,7 +33,7 @@ pub enum CatalogFamily {
 }
 
 impl CatalogFamily {
-    pub const fn as_str(self) -> &'static str {
+    pub(crate) const fn as_str(self) -> &'static str {
         match self {
             Self::Schemas => "schemas",
             Self::Relations => "relations",
@@ -55,27 +55,27 @@ impl CatalogFamily {
 /// Schema boundary for the schema-scoped catalog families in [`CatalogCoverage`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
-pub enum SchemaCoverage {
+pub(crate) enum SchemaCoverage {
     AllNonSystem,
     Explicit(BTreeSet<String>),
 }
 
 impl SchemaCoverage {
-    pub fn from_sync_scope(schemas: Option<&[String]>) -> Self {
+    pub(crate) fn from_sync_scope(schemas: Option<&[String]>) -> Self {
         match schemas {
             Some(schemas) => Self::Explicit(schemas.iter().cloned().collect()),
             None => Self::AllNonSystem,
         }
     }
 
-    pub fn covers(&self, schema: &str) -> bool {
+    pub(crate) fn covers(&self, schema: &str) -> bool {
         match self {
             Self::AllNonSystem => true,
             Self::Explicit(schemas) => schemas.contains(schema),
         }
     }
 
-    pub fn explicit_schemas(&self) -> Option<Vec<String>> {
+    pub(crate) fn explicit_schemas(&self) -> Option<Vec<String>> {
         match self {
             Self::AllNonSystem => None,
             Self::Explicit(schemas) => Some(schemas.iter().cloned().collect()),
@@ -87,13 +87,13 @@ impl SchemaCoverage {
 /// validation. The schema boundary applies to schema-scoped families; role,
 /// publication, and subscription rows are recorded separately in `families`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct CatalogCoverage {
+pub(crate) struct CatalogCoverage {
     pub schema_scope: SchemaCoverage,
     pub families: BTreeSet<CatalogFamily>,
 }
 
 impl CatalogCoverage {
-    pub fn from_sync_scope(schemas: Option<&[String]>) -> Self {
+    pub(crate) fn from_sync_scope(schemas: Option<&[String]>) -> Self {
         Self {
             schema_scope: SchemaCoverage::from_sync_scope(schemas),
             families: [
@@ -116,11 +116,11 @@ impl CatalogCoverage {
         }
     }
 
-    pub fn has(&self, family: CatalogFamily) -> bool {
+    pub(crate) fn has(&self, family: CatalogFamily) -> bool {
         self.families.contains(&family)
     }
 
-    pub fn family_names(&self) -> impl Iterator<Item = &'static str> + '_ {
+    pub(crate) fn family_names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.families.iter().copied().map(CatalogFamily::as_str)
     }
 }
@@ -129,18 +129,18 @@ impl Default for CatalogCoverage {
     fn default() -> Self {
         // Programmatic test baselines retain the historical all-schema
         // assumption. Production sync always overwrites this with its actual
-        // requested scope before a V7 cache can be written.
+        // requested scope before a V8 cache can be written.
         Self::from_sync_scope(None)
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ForeignKeyCache {
+pub(crate) struct ForeignKeyCache {
     pub constraint_name: String,
     pub from_table: ObjectId,
     pub to_table: ObjectId,
     /// Ordered `pg_constraint.conkey` identities resolved through
-    /// `pg_attribute`. Empty vectors are invalid for V7 FK records.
+    /// `pg_attribute`. Empty vectors are invalid for V8 FK records.
     pub from_columns: Vec<String>,
     /// Ordered `pg_constraint.confkey` identities resolved through
     /// `pg_attribute`. Position pairs with `from_columns`.
@@ -156,7 +156,7 @@ pub struct ForeignKeyCache {
 }
 
 impl ForeignKeyCache {
-    pub fn has_complete_operator_evidence(&self) -> bool {
+    pub(crate) fn has_complete_operator_evidence(&self) -> bool {
         let count = self.from_columns.len();
         count > 0
             && self.to_columns.len() == count
@@ -175,9 +175,9 @@ impl ForeignKeyCache {
 
 /// Ordered key columns for a primary or unique constraint. This is separate
 /// from `ConstraintState` so the runtime state model remains focused on the
-/// mutable constraint lifecycle while Cache V7 can preserve catalog proof.
+/// mutable constraint lifecycle while Cache V8 can preserve catalog proof.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConstraintKeyCache {
+pub(crate) struct ConstraintKeyCache {
     pub table_id: ObjectId,
     pub constraint_name: String,
     pub columns: Vec<String>,
@@ -188,7 +188,7 @@ pub struct ConstraintKeyCache {
 /// (currently CHECK and EXCLUDE). An empty vector is authoritative: the
 /// expression has no relation-column dependency.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ConstraintDependencyCache {
+pub(crate) struct ConstraintDependencyCache {
     pub table_id: ObjectId,
     pub constraint_name: String,
     pub columns: Vec<String>,
@@ -199,7 +199,7 @@ pub struct ConstraintDependencyCache {
 /// remove only its own expression edge; source-column drops remain
 /// conservative until dependent-column CASCADE is modeled.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct GeneratedColumnDependencyCache {
+pub(crate) struct GeneratedColumnDependencyCache {
     pub table_id: ObjectId,
     pub column_name: String,
     pub depends_on_column: String,
@@ -209,14 +209,14 @@ pub struct GeneratedColumnDependencyCache {
 /// This is distinct from sequence OWNED BY metadata: a default can reference
 /// a standalone sequence without making that sequence owned by the table.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct DefaultSequenceDependencyCache {
+pub(crate) struct DefaultSequenceDependencyCache {
     pub table_id: ObjectId,
     pub column_name: String,
     pub sequence_id: ObjectId,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct IndexCache {
+pub(crate) struct IndexCache {
     pub index_id: ObjectId,
     pub table_id: ObjectId,
     pub using_method: String,
@@ -235,6 +235,8 @@ pub struct IndexCache {
     pub has_expression_keys: bool,
     pub has_predicate: bool,
     pub is_unique: bool,
+    /// `pg_index.indimmediate`; deferred unique indexes cannot be a replica identity.
+    pub is_immediate: bool,
     pub is_valid: bool,
     pub is_ready: bool,
     pub is_live: bool,
@@ -244,10 +246,14 @@ pub struct IndexCache {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TriggerCache {
+pub(crate) struct TriggerCache {
     pub trigger_id: ObjectId,
     pub table_id: ObjectId,
     pub function_id: ObjectId,
+    #[serde(default)]
+    pub row_level: bool,
+    #[serde(default)]
+    pub parent_trigger_id: Option<ObjectId>,
     pub enabled_mode: TriggerEnableMode,
 }
 
@@ -259,7 +265,7 @@ pub struct TriggerCache {
 /// alongside names made the old record look more authoritative without adding
 /// a transition consumer.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct ViewDependencyCache {
+pub(crate) struct ViewDependencyCache {
     pub dependent: ObjectId,
     pub referenced: ObjectId,
     /// `None` means PostgreSQL reported a relation-level dependency. Such a
@@ -274,7 +280,7 @@ pub struct ViewDependencyCache {
 /// direct parent/child direction for partition-cycle and publication scope
 /// reasoning.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct InheritanceCache {
+pub(crate) struct InheritanceCache {
     pub child: ObjectId,
     pub parent: ObjectId,
     pub sequence: i32,
@@ -285,7 +291,7 @@ pub struct InheritanceCache {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, Default)]
-pub struct CacheMetadata {
+pub(crate) struct CacheMetadata {
     /// Seconds since the Unix epoch when `safe-migrate sync` assembled this
     /// baseline. `None` represents a cache written before provenance support.
     pub created_at_unix_secs: Option<u64>,
@@ -319,7 +325,7 @@ pub struct CacheMetadata {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct DbCache {
+pub(crate) struct DbCache {
     pub pg_version_num: Option<u32>,
     pub metadata: CacheMetadata,
     pub coverage: CatalogCoverage,
@@ -337,11 +343,18 @@ pub struct DbCache {
     pub types: HashMap<ObjectId, TypeState>,
     pub roles: HashMap<ObjectId, RoleState>,
     /// Grantor provenance for role memberships, used by membership CASCADE.
+    /// PostgreSQL bookkeeping allows several records per (member, role) pair,
+    /// one per grantor, each carrying its own option flags.
     #[serde(default)]
     pub role_membership_grantors: Vec<RoleMembershipGrantor>,
     /// True only when the synchronizer queried every membership grantor row.
     #[serde(default)]
     pub role_membership_grantors_complete: bool,
+    /// The cluster's bootstrap superuser (the role PG attacks implicit
+    /// superuser-issued role grants to, via `BOOTSTRAP_SUPERUSERID`). Absent
+    /// when a programmatic cache did not record it.
+    #[serde(default)]
+    pub bootstrap_superuser: Option<String>,
     pub schemas: HashMap<String, SchemaState>,
     pub sequences: HashMap<ObjectId, SequenceState>,
     pub dependencies: Vec<ViewDependencyCache>,
@@ -352,19 +365,19 @@ pub struct DbCache {
     pub scoped_external_relation_dependencies: Vec<ObjectId>,
     pub scoped_external_type_dependencies: Vec<ObjectId>,
     pub scoped_external_routine_dependencies: Vec<ObjectId>,
+    pub scoped_external_index_dependencies: Vec<ObjectId>,
     pub inheritances: Vec<InheritanceCache>,
     pub publications: HashMap<String, PublicationState>,
     pub subscriptions: HashMap<String, SubscriptionState>,
 }
 
-pub const CACHE_FORMAT_VERSION: u32 = 7;
+pub(crate) const CACHE_FORMAT_VERSION: u32 = 8;
 
-/// Current durable cache header. V7 adds PostgreSQL-selected FK equality
-/// operator evidence to the normalized catalog snapshot.
-pub const CACHE_V7_MAGIC: &[u8] = b"SMCACHE07";
+/// Current durable cache header. V8 adds typed-table row-type identity.
+pub(crate) const CACHE_V8_MAGIC: &[u8] = b"SMCACHE08";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub enum DbCacheVersioned {
+pub(crate) enum DbCacheVersioned {
     // Unit variants reserve the historic bincode discriminants. The reader
     // rejects non-current headers before decoding, so legacy layouts are not part
     // of the production model and cannot be converted accidentally.
@@ -375,10 +388,11 @@ pub enum DbCacheVersioned {
     V5(Box<DbCache>),
     V6(Box<DbCache>),
     V7(Box<DbCache>),
+    V8(Box<DbCache>),
 }
 
 impl DbCacheVersioned {
-    pub fn format_version(&self) -> u32 {
+    pub(crate) fn format_version(&self) -> u32 {
         match self {
             DbCacheVersioned::V1 => 1,
             DbCacheVersioned::V2 => 2,
@@ -387,21 +401,23 @@ impl DbCacheVersioned {
             DbCacheVersioned::V5(_) => 5,
             DbCacheVersioned::V6(_) => 6,
             DbCacheVersioned::V7(_) => 7,
+            DbCacheVersioned::V8(_) => 8,
         }
     }
 
-    pub fn into_cache(self) -> Result<DbCache, String> {
+    pub(crate) fn into_cache(self) -> Result<DbCache, String> {
         match self {
             DbCacheVersioned::V1
             | DbCacheVersioned::V2
             | DbCacheVersioned::V3
             | DbCacheVersioned::V4
             | DbCacheVersioned::V5(_)
-            | DbCacheVersioned::V6(_) => Err(
+            | DbCacheVersioned::V6(_)
+            | DbCacheVersioned::V7(_) => Err(
                 "This cache format is unsupported. Run `safe-migrate sync` to rebuild it."
                     .to_string(),
             ),
-            DbCacheVersioned::V7(c) => {
+            DbCacheVersioned::V8(c) => {
                 c.validate_semantics()?;
                 Ok(*c)
             }
@@ -416,7 +432,7 @@ impl Default for DbCache {
 }
 
 impl DbCache {
-    pub fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             pg_version_num: None,
             metadata: CacheMetadata::default(),
@@ -436,23 +452,26 @@ impl DbCache {
             roles: HashMap::new(),
             role_membership_grantors: Vec::new(),
             role_membership_grantors_complete: false,
+            bootstrap_superuser: None,
             schemas: HashMap::new(),
             sequences: HashMap::new(),
             dependencies: Vec::new(),
             scoped_external_relation_dependencies: Vec::new(),
             scoped_external_type_dependencies: Vec::new(),
             scoped_external_routine_dependencies: Vec::new(),
+            scoped_external_index_dependencies: Vec::new(),
             inheritances: Vec::new(),
             publications: HashMap::new(),
             subscriptions: HashMap::new(),
         }
     }
 
-    pub fn insert_baseline(&mut self, id: ObjectId, state: RelationState) {
+    #[cfg(test)]
+    pub(crate) fn insert_baseline(&mut self, id: ObjectId, state: RelationState) {
         self.relations.insert(id, state);
     }
 
-    pub fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
+    pub(crate) fn baseline_relations(&self) -> impl Iterator<Item = (&ObjectId, &RelationState)> {
         self.relations.iter()
     }
 
@@ -490,7 +509,7 @@ impl DbCache {
 
     /// Validate cross-record identity, relationship, and catalog-coverage
     /// invariants before a cache is used as an authoritative baseline.
-    pub fn validate_semantics(&self) -> Result<(), String> {
+    pub(crate) fn validate_semantics(&self) -> Result<(), String> {
         // Cache identities are authoritative catalog names, never resolver
         // guesses. Reject malformed or inferred IDs at the boundary so every
         // downstream map lookup has one canonical representation.
@@ -522,6 +541,10 @@ impl DbCache {
             }
             Ok(())
         };
+
+        if self.pg_version_num.is_some_and(|version| version < 140_000) {
+            return Err("Cache V8 was synchronized from an unsupported PostgreSQL version; PostgreSQL 14 or newer is required".to_string());
+        }
 
         if let Some(schemas) = &self.metadata.schemas {
             let mut seen = HashSet::new();
@@ -586,7 +609,7 @@ impl DbCache {
         for family in required_families {
             if !self.coverage.has(family) {
                 return Err(format!(
-                    "Cache V7 coverage is missing the required '{}' catalog family",
+                    "Cache V8 coverage is missing the required '{}' catalog family",
                     family.as_str(),
                 ));
             }
@@ -622,6 +645,10 @@ impl DbCache {
                 "scoped external routine dependency",
                 &self.scoped_external_routine_dependencies,
             ),
+            (
+                "scoped external index dependency",
+                &self.scoped_external_index_dependencies,
+            ),
         ] {
             let mut seen = HashSet::new();
             for id in ids {
@@ -655,9 +682,10 @@ impl DbCache {
             .map(|schemas| schemas.iter().cloned().collect::<BTreeSet<_>>());
         if coverage_scope != metadata_scope {
             return Err(
-                "Cache V7 schema coverage disagrees with legacy metadata schema scope".to_string(),
+                "Cache V8 schema coverage disagrees with legacy metadata schema scope".to_string(),
             );
         }
+        let mut extended_statistics_ids = HashSet::new();
         for (id, relation) in &self.relations {
             validate_id("relation cache identity", id, true)?;
             validate_id("relation embedded identity", &relation.id, true)?;
@@ -676,6 +704,22 @@ impl DbCache {
                     id
                 ));
             }
+            for (label, value) in [
+                ("tablespace", relation.tablespace.as_deref()),
+                ("access method", relation.access_method.as_deref()),
+                ("cluster index", relation.cluster_index.as_deref()),
+            ] {
+                if value.is_some_and(str::is_empty) {
+                    return Err(format!("relation '{}' has an empty {label}", id));
+                }
+            }
+            if relation
+                .table_options
+                .iter()
+                .any(|(key, value)| key.is_empty() || value.is_empty())
+            {
+                return Err(format!("relation '{}' has a malformed table option", id));
+            }
             let mut column_names = HashSet::new();
             for column in &relation.columns {
                 if column.name.is_empty() {
@@ -688,6 +732,135 @@ impl DbCache {
                     return Err(format!(
                         "relation '{}' contains duplicate column '{}', which makes lookup ambiguous",
                         id, column.name
+                    ));
+                }
+                if column
+                    .options
+                    .iter()
+                    .any(|(key, value)| key.is_empty() || value.is_empty())
+                {
+                    return Err(format!(
+                        "relation '{}.{}' has a malformed column option",
+                        id, column.name
+                    ));
+                }
+            }
+            for (statistics_id, statistics) in &relation.extended_statistics {
+                validate_id("extended statistics identity", statistics_id, true)?;
+                if statistics_id != &statistics.id
+                    || !extended_statistics_ids.insert(statistics_id.clone())
+                {
+                    return Err(format!(
+                        "extended statistics '{}' have a duplicate or inconsistent identity",
+                        statistics_id
+                    ));
+                }
+                if statistics.kinds.is_empty()
+                    || statistics
+                        .kinds
+                        .iter()
+                        .any(|kind| !matches!(kind.as_str(), "d" | "f" | "m"))
+                    || (statistics.columns.is_empty()
+                        && statistics.expressions.as_deref().is_none_or(str::is_empty))
+                    || statistics
+                        .columns
+                        .iter()
+                        .any(|column| !column_names.contains(column.as_str()))
+                    || statistics.target.is_some_and(|target| target < -1)
+                {
+                    return Err(format!(
+                        "extended statistics '{}' contain malformed catalog metadata",
+                        statistics_id
+                    ));
+                }
+            }
+            if relation.rules.keys().any(String::is_empty) {
+                return Err(format!("relation '{}' contains an empty rule identity", id));
+            }
+            for (column, provenance) in &relation.column_inheritance {
+                if !column_names.contains(column.as_str())
+                    || provenance.parent_count > i32::MAX as u32
+                    || (provenance.parent_count == 0 && !provenance.is_local)
+                {
+                    return Err(format!(
+                        "relation '{}' contains invalid inheritance provenance for column '{}'",
+                        id, column
+                    ));
+                }
+            }
+            for column in relation.identity_columns.keys() {
+                let Some(column_state) = relation.get_column(column) else {
+                    return Err(format!(
+                        "relation '{}' identifies missing column '{}' as an identity column",
+                        id, column
+                    ));
+                };
+                if column_state.generated == Some(true) {
+                    return Err(format!(
+                        "relation '{}.{}' cannot be both identity and generated",
+                        id, column
+                    ));
+                }
+            }
+            for (column, generated) in &relation.generated_columns {
+                let Some(column_state) = relation.get_column(column) else {
+                    return Err(format!(
+                        "relation '{}' identifies missing column '{}' as generated",
+                        id, column
+                    ));
+                };
+                if relation.identity_columns.contains_key(column)
+                    || column_state.generated == Some(false)
+                {
+                    return Err(format!(
+                        "relation '{}.{}' has inconsistent generated-column metadata",
+                        id, column
+                    ));
+                }
+                if generated.expression.as_deref().is_some_and(str::is_empty) {
+                    return Err(format!(
+                        "relation '{}.{}' has an empty generated expression",
+                        id, column
+                    ));
+                }
+            }
+            for column in &relation.columns {
+                if column.generated == Some(true)
+                    && !relation.generated_columns.contains_key(&column.name)
+                {
+                    return Err(format!(
+                        "relation '{}.{}' lacks generated-column metadata",
+                        id, column.name
+                    ));
+                }
+            }
+            if let Some(type_id) = &relation.of_type {
+                validate_id("typed-table composite type identity", type_id, true)?;
+                let Some(type_state) = self.types.get(type_id) else {
+                    return Err(format!(
+                        "typed table '{}' references missing composite type '{}'",
+                        id, type_id
+                    ));
+                };
+                let TypeKind::Composite { fields } = &type_state.kind else {
+                    return Err(format!(
+                        "typed table '{}' references non-composite type '{}'",
+                        id, type_id
+                    ));
+                };
+                let matches_layout = relation.columns.len() == fields.len()
+                    && relation.columns.iter().zip(fields).all(|(column, field)| {
+                        column.name == field.name
+                            && column.data_type.as_deref().is_some_and(|data_type| {
+                                data_type
+                                    .trim()
+                                    .eq_ignore_ascii_case(field.data_type.trim())
+                            })
+                    });
+                if !matches_layout {
+                    return Err(format!(
+                        "typed table '{}' does not match composite type '{}' column layout",
+                        id, type_id
                     ));
                 }
             }
@@ -837,6 +1010,27 @@ impl DbCache {
                     "sequence '{}' collides with another relation-namespace object",
                     id
                 ));
+            }
+            let (type_min, type_max) = match sequence.parameters.data_type.as_str() {
+                "smallint" => (i16::MIN as i64, i16::MAX as i64),
+                "integer" => (i32::MIN as i64, i32::MAX as i64),
+                "bigint" => (i64::MIN, i64::MAX),
+                other => {
+                    return Err(format!(
+                        "sequence '{}' has unsupported data type '{}'",
+                        id, other
+                    ));
+                }
+            };
+            if sequence.parameters.increment == 0
+                || sequence.parameters.cache_size < 1
+                || sequence.parameters.min_value < type_min
+                || sequence.parameters.max_value > type_max
+                || sequence.parameters.min_value >= sequence.parameters.max_value
+                || !(sequence.parameters.min_value..=sequence.parameters.max_value)
+                    .contains(&sequence.parameters.start_value)
+            {
+                return Err(format!("sequence '{}' has invalid sequence parameters", id));
             }
         }
         for (name, publication) in &self.publications {
@@ -1033,6 +1227,33 @@ impl DbCache {
                         id, table_id, column_name
                     ));
                 }
+                if matches!(sequence.kind, SequenceKind::Identity)
+                    && !relation.identity_columns.contains_key(column_name)
+                {
+                    return Err(format!(
+                        "identity sequence '{}' owns non-identity column '{}.{}'",
+                        id, table_id, column_name
+                    ));
+                }
+            }
+        }
+        for relation in self.relations.values() {
+            for column in relation.identity_columns.keys() {
+                let owners = self
+                    .sequences
+                    .values()
+                    .filter(|sequence| {
+                        matches!(sequence.kind, SequenceKind::Identity)
+                            && sequence.owned_by.as_ref()
+                                == Some(&(relation.id.clone(), column.clone()))
+                    })
+                    .count();
+                if owners != 1 {
+                    return Err(format!(
+                        "identity column '{}.{}' must have exactly one owned identity sequence",
+                        relation.id, column
+                    ));
+                }
             }
         }
 
@@ -1139,17 +1360,27 @@ impl DbCache {
                     provenance.member, provenance.role
                 ));
             }
-            if !membership_grantors.insert((provenance.member.clone(), provenance.role.clone())) {
+            // PostgreSQL 16+ may record several memberships for the same
+            // edge, one per grantor.  Uniqueness applies to the full tuple,
+            // not the (member, role) pair.
+            if !membership_grantors.insert((
+                provenance.member.clone(),
+                provenance.role.clone(),
+                provenance.grantor.clone(),
+            )) {
                 return Err(format!(
-                    "duplicate role membership provenance for '{}' -> '{}'",
-                    provenance.member, provenance.role
+                    "duplicate role membership provenance for '{}' -> '{}' by '{}'",
+                    provenance.member, provenance.role, provenance.grantor
                 ));
             }
         }
         if self.role_membership_grantors_complete {
             for (member_id, role) in &self.roles {
                 for role_id in &role.member_of {
-                    if !membership_grantors.contains(&(member_id.clone(), role_id.clone())) {
+                    if !membership_grantors
+                        .iter()
+                        .any(|(m, r, _)| m == member_id && r == role_id)
+                    {
                         return Err(format!(
                             "complete role membership provenance is missing for '{}' -> '{}'",
                             member_id, role_id
@@ -1183,6 +1414,17 @@ impl DbCache {
             if !constraint_ids.insert((constraint.table_id.clone(), constraint.name.clone())) {
                 return Err(format!(
                     "constraint '{}.{}' appears more than once",
+                    constraint.table_id, constraint.name
+                ));
+            }
+            if matches!(constraint.kind, ConstraintKind::Check)
+                && constraint
+                    .definition
+                    .as_deref()
+                    .is_none_or(|definition| definition.trim().is_empty())
+            {
+                return Err(format!(
+                    "CHECK constraint '{}.{}' lacks its expression definition",
                     constraint.table_id, constraint.name
                 ));
             }
@@ -1360,6 +1602,76 @@ impl DbCache {
             }
         }
 
+        // These relation fields are consumed by typed ALTER TABLE handling.
+        // Validate their cross-catalog references at the cache boundary so a
+        // decoded baseline cannot turn malformed metadata into an exact state.
+        for relation in self.relations.values() {
+            if let Some(cluster_index) = &relation.cluster_index {
+                let index_id = ObjectId::new(&relation.id.schema, cluster_index);
+                if !self
+                    .indexes
+                    .iter()
+                    .any(|index| index.index_id == index_id && index.table_id == relation.id)
+                {
+                    return Err(format!(
+                        "relation '{}' clusters on index '{}' that does not belong to it",
+                        relation.id, cluster_index
+                    ));
+                }
+            }
+            let Some(replica_identity) = &relation.replica_identity else {
+                continue;
+            };
+            let Some(index_name) = replica_identity.strip_prefix("USING INDEX ") else {
+                if matches!(
+                    replica_identity.as_str(),
+                    "DEFAULT" | "NOTHING" | "FULL" | "USING INDEX"
+                ) {
+                    continue;
+                }
+                return Err(format!(
+                    "relation '{}' has an invalid replica identity '{}'",
+                    relation.id, replica_identity
+                ));
+            };
+            if index_name.is_empty() {
+                return Err(format!(
+                    "relation '{}' has an empty replica identity index",
+                    relation.id
+                ));
+            }
+            let index_id = ObjectId::new(&relation.id.schema, index_name);
+            let Some(index) = self
+                .indexes
+                .iter()
+                .find(|index| index.index_id == index_id && index.table_id == relation.id)
+            else {
+                return Err(format!(
+                    "relation '{}' uses missing replica identity index '{}'",
+                    relation.id, index_name
+                ));
+            };
+            let all_keys_not_null = index.key_columns.iter().all(|column| {
+                relation
+                    .get_column(column)
+                    .is_some_and(|column| !column.is_nullable)
+            });
+            if !index.is_unique
+                || index.has_predicate
+                || index.has_expression_keys
+                || !index.is_valid
+                || !index.is_immediate
+                || !index.is_ready
+                || !index.is_live
+                || !all_keys_not_null
+            {
+                return Err(format!(
+                    "relation '{}' uses ineligible replica identity index '{}'",
+                    relation.id, index_name
+                ));
+            }
+        }
+
         let mut trigger_ids = HashSet::new();
         for trigger in &self.triggers {
             validate_id("trigger identity", &trigger.trigger_id, true)?;
@@ -1383,11 +1695,37 @@ impl DbCache {
                     trigger.trigger_id
                 ));
             }
-            if !trigger_ids.insert(trigger.trigger_id.clone()) {
+            if !trigger_ids.insert((trigger.table_id.clone(), trigger.trigger_id.name.clone())) {
                 return Err(format!(
-                    "trigger '{}' appears more than once",
-                    trigger.trigger_id
+                    "trigger '{}' appears more than once on relation '{}'",
+                    trigger.trigger_id.name, trigger.table_id
                 ));
+            }
+        }
+        let trigger_keys: HashSet<ObjectId> = self
+            .triggers
+            .iter()
+            .map(|trigger| {
+                ObjectId::new(
+                    &trigger.table_id.schema,
+                    format!("{}\0{}", trigger.table_id.name, trigger.trigger_id.name),
+                )
+            })
+            .collect();
+        for trigger in &self.triggers {
+            if let Some(parent_id) = &trigger.parent_trigger_id {
+                if !trigger.row_level {
+                    return Err(format!(
+                        "statement-level trigger '{}' cannot be a partition clone",
+                        trigger.trigger_id
+                    ));
+                }
+                if !trigger_keys.contains(parent_id) {
+                    return Err(format!(
+                        "trigger '{}' references missing parent trigger '{}'",
+                        trigger.trigger_id, parent_id
+                    ));
+                }
             }
         }
 
@@ -1520,6 +1858,7 @@ impl DbCache {
         }
 
         let mut inheritance_pairs = HashSet::new();
+        let mut pending_parents = HashSet::new();
         for inheritance in &self.inheritances {
             validate_id("inheritance child identity", &inheritance.child, true)?;
             validate_id("inheritance parent identity", &inheritance.parent, true)?;
@@ -1530,10 +1869,23 @@ impl DbCache {
                 ));
             }
             if inheritance.detach_pending {
-                return Err(format!(
-                    "inheritance '{} -> {}' is being detached; synchronize after the detach completes",
-                    inheritance.child, inheritance.parent
-                ));
+                if !inheritance.is_partition
+                    || self
+                        .relations
+                        .get(&inheritance.parent)
+                        .is_some_and(|parent| parent.partition_type.is_none())
+                    || self
+                        .relations
+                        .get(&inheritance.child)
+                        .is_some_and(|child| child.partition_bound.is_none())
+                {
+                    return Err(
+                        "pending detach requires a bounded partition and partitioned parent".into(),
+                    );
+                }
+                if !pending_parents.insert(inheritance.parent.clone()) {
+                    return Err("a partitioned parent cannot have multiple pending detaches".into());
+                }
             }
             let omitted_schema = |schema: &str| {
                 self.metadata
@@ -1794,7 +2146,7 @@ impl DbCache {
     /// Return this cache only when all semantic invariants pass validation.
     /// This is the supported constructor for library callers that build a
     /// cache without going through the on-disk decoder.
-    pub fn validated(self) -> Result<Self, String> {
+    pub(crate) fn validated(self) -> Result<Self, String> {
         self.validate_semantics()?;
         Ok(self)
     }
@@ -1825,6 +2177,11 @@ mod tests {
                 avg_width: Some(4),
                 default_expr_text: None,
                 type_modifier: None,
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             })
             .collect();
         relation
@@ -1859,10 +2216,49 @@ mod tests {
     }
 
     #[test]
-    fn current_cache_format_is_v7() {
-        assert_eq!(CACHE_FORMAT_VERSION, 7);
-        assert_eq!(DbCacheVersioned::V7(Box::default()).format_version(), 7);
-        assert_eq!(CACHE_V7_MAGIC, b"SMCACHE07");
+    fn current_cache_format_is_v8() {
+        assert_eq!(CACHE_FORMAT_VERSION, 8);
+        assert_eq!(DbCacheVersioned::V8(Box::default()).format_version(), 8);
+        assert_eq!(CACHE_V8_MAGIC, b"SMCACHE08");
+    }
+
+    #[test]
+    fn current_cache_rejects_an_unsupported_postgresql_version() {
+        let mut cache = DbCache::new();
+        cache.pg_version_num = Some(130_000);
+
+        let error = cache.validate_semantics().unwrap_err();
+        assert!(error.contains("PostgreSQL 14 or newer"));
+    }
+
+    #[test]
+    fn current_cache_rejects_malformed_relation_and_column_options() {
+        let id = ObjectId::new("public", "entries");
+        let mut cache = DbCache::new();
+        let mut relation = table(id.clone(), &["id"]);
+        relation
+            .table_options
+            .insert("".to_string(), "1".to_string());
+        cache.insert_baseline(id.clone(), relation);
+        assert!(
+            cache
+                .validate_semantics()
+                .unwrap_err()
+                .contains("malformed table option")
+        );
+
+        let mut cache = DbCache::new();
+        let mut relation = table(id.clone(), &["id"]);
+        relation.columns[0]
+            .options
+            .insert("n_distinct".to_string(), "".to_string());
+        cache.insert_baseline(id, relation);
+        assert!(
+            cache
+                .validate_semantics()
+                .unwrap_err()
+                .contains("malformed column option")
+        );
     }
 
     #[test]
@@ -1891,7 +2287,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema cache key 'app'"));
@@ -1902,10 +2298,46 @@ mod tests {
         let mut cache = DbCache::new();
         cache.metadata.schemas = Some(vec!["app".to_string()]);
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("schema coverage disagrees"));
+    }
+
+    #[test]
+    fn current_cache_rejects_typed_table_with_missing_or_mismatched_type() {
+        let table_id = ObjectId::new("public", "addresses");
+        let type_id = ObjectId::new("public", "address");
+        let mut cache = DbCache::new();
+        let mut relation = table(table_id.clone(), &["zip"]);
+        relation.of_type = Some(type_id.clone());
+        cache.insert_baseline(table_id.clone(), relation.clone());
+        assert!(
+            cache
+                .validate_semantics()
+                .unwrap_err()
+                .contains("references missing composite type")
+        );
+
+        cache.types.insert(
+            type_id,
+            TypeState {
+                id: ObjectId::new("public", "address"),
+                generation: 0,
+                kind: TypeKind::Composite {
+                    fields: vec![crate::_internal::model::types::CompositeFieldState {
+                        name: "street".to_string(),
+                        data_type: "text".to_string(),
+                    }],
+                },
+            },
+        );
+        assert!(
+            cache
+                .validate_semantics()
+                .unwrap_err()
+                .contains("does not match composite type")
+        );
     }
 
     #[test]
@@ -1920,6 +2352,7 @@ mod tests {
             name: "child_parent_id_fkey".to_string(),
             kind: crate::_internal::model::constraint::ConstraintKind::ForeignKey,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
@@ -1949,6 +2382,7 @@ mod tests {
             name: "child_parent_fkey".to_string(),
             kind: ConstraintKind::ForeignKey,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
@@ -1978,6 +2412,7 @@ mod tests {
             name: "child_parent_fkey".into(),
             kind: ConstraintKind::ForeignKey,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache.foreign_keys.push(ForeignKeyCache {
@@ -2005,6 +2440,7 @@ mod tests {
             name: "parent_pkey".to_string(),
             kind: ConstraintKind::PrimaryKey,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache.constraint_keys.push(ConstraintKeyCache {
@@ -2034,6 +2470,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -2046,6 +2483,7 @@ mod tests {
             name: "ranges_excl_constraint".to_string(),
             kind: ConstraintKind::Exclusion,
             validated: true,
+            definition: None,
             backing_index: Some(index_id),
         });
 
@@ -2231,6 +2669,33 @@ mod tests {
     }
 
     #[test]
+    fn current_cache_rejects_invalid_column_inheritance_provenance() {
+        for (column, parent_count, is_local) in [
+            ("missing", 1, false),
+            ("id", 0, false),
+            ("id", u32::MAX, true),
+        ] {
+            let id = ObjectId::new("public", "entries");
+            let mut relation = table(id.clone(), &["id"]);
+            relation.column_inheritance.insert(
+                column.into(),
+                crate::_internal::model::relation::ColumnInheritance {
+                    parent_count,
+                    is_local,
+                },
+            );
+            let mut cache = DbCache::new();
+            cache.insert_baseline(id, relation);
+            assert!(
+                cache
+                    .validate_semantics()
+                    .unwrap_err()
+                    .contains("inheritance provenance")
+            );
+        }
+    }
+
+    #[test]
     fn current_cache_rejects_ambiguous_relation_columns() {
         let table_id = ObjectId::new("public", "entries");
         let mut cache = DbCache::new();
@@ -2360,7 +2825,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("empty or duplicate table column"));
@@ -2396,7 +2861,7 @@ mod tests {
             },
         );
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("owner 'missing_owner' is absent"));
@@ -2487,6 +2952,7 @@ mod tests {
             name: "entries_key".to_string(),
             kind: ConstraintKind::Unique,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache.constraint_keys.push(ConstraintKeyCache {
@@ -2592,6 +3058,7 @@ mod tests {
                 name: "entries_check".to_string(),
                 kind: crate::_internal::model::constraint::ConstraintKind::Check,
                 validated: true,
+                definition: Some("id > 0".to_string()),
                 backing_index: None,
             });
         cache
@@ -2679,6 +3146,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -2687,7 +3155,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("references missing relation 'public.items'"));
@@ -2709,6 +3177,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -2717,7 +3186,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as indexed relation"));
@@ -2741,6 +3210,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -2749,7 +3219,7 @@ mod tests {
             has_default_collations: true,
         });
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -2769,11 +3239,12 @@ mod tests {
                 owner: ObjectId::new("", "postgres"),
                 owned_by: None,
                 kind: crate::_internal::model::sequence::SequenceKind::Owned,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("collides with another relation-namespace object"));
@@ -2788,10 +3259,12 @@ mod tests {
             trigger_id: ObjectId::new("other", "items_trigger"),
             table_id,
             function_id: ObjectId::new("public", "items_trigger_fn()"),
+            row_level: true,
+            parent_trigger_id: None,
             enabled_mode: TriggerEnableMode::Origin,
         });
 
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
         assert!(error.contains("must be in the same schema as trigger table"));
@@ -2813,6 +3286,7 @@ mod tests {
             has_expression_keys: false,
             has_predicate: false,
             is_unique: false,
+            is_immediate: true,
             is_valid: true,
             is_ready: true,
             is_live: true,
@@ -2822,7 +3296,7 @@ mod tests {
         });
 
         assert!(
-            DbCacheVersioned::V7(Box::new(cache))
+            DbCacheVersioned::V8(Box::new(cache))
                 .into_cache()
                 .unwrap_err()
                 .contains("missing complete dependency-column evidence")
@@ -2845,16 +3319,38 @@ mod tests {
             detach_pending: false,
         });
         assert!(
-            DbCacheVersioned::V7(Box::new(cache.clone()))
+            DbCacheVersioned::V8(Box::new(cache.clone()))
                 .into_cache()
                 .is_ok()
         );
 
         cache.inheritances[0].detach_pending = true;
-        let error = DbCacheVersioned::V7(Box::new(cache))
+        let error = DbCacheVersioned::V8(Box::new(cache))
             .into_cache()
             .unwrap_err();
-        assert!(error.contains("being detached"));
+        assert!(error.contains("pending detach requires"));
+    }
+
+    #[test]
+    fn current_cache_accepts_pending_partition_detach() {
+        let parent = ObjectId::new("public", "parent");
+        let child = ObjectId::new("public", "child");
+        let mut cache = DbCache::new();
+        cache.search_path.clear();
+        let mut parent_relation = table(parent.clone(), &["id"]);
+        parent_relation.partition_type = Some("RANGE".into());
+        let mut child_relation = table(child.clone(), &["id"]);
+        child_relation.partition_bound = Some("FOR VALUES FROM (0) TO (10)".into());
+        cache.insert_baseline(parent.clone(), parent_relation);
+        cache.insert_baseline(child.clone(), child_relation);
+        cache.inheritances.push(InheritanceCache {
+            child,
+            parent,
+            sequence: 1,
+            is_partition: true,
+            detach_pending: true,
+        });
+        assert!(DbCacheVersioned::V8(Box::new(cache)).into_cache().is_ok());
     }
 
     #[test]
@@ -2884,6 +3380,7 @@ mod tests {
                 owner: ObjectId::new("", "postgres"),
                 owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
                 kind: crate::_internal::model::sequence::SequenceKind::Owned,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -2904,6 +3401,7 @@ mod tests {
                 owner: ObjectId::new("", "postgres"),
                 owned_by: Some((ObjectId::new("public", "items"), "id".to_string())),
                 kind: crate::_internal::model::sequence::SequenceKind::Owned,
+                parameters: Default::default(),
                 generation: 0,
             },
         );

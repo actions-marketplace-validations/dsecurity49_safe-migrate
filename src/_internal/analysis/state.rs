@@ -10,7 +10,7 @@ use crate::_internal::db::cache::CatalogCoverage;
 use crate::_internal::db::cache::DbCache;
 use crate::_internal::model::constraint::ConstraintState;
 use crate::_internal::model::function::FunctionOverlay;
-pub use crate::_internal::model::relation::RelationOverlay;
+pub(crate) use crate::_internal::model::relation::RelationOverlay;
 use crate::_internal::model::relation::{Persistence, Privilege, RelationKind};
 use crate::_internal::model::schema::SchemaOverlay;
 use crate::_internal::model::sequence::SequenceOverlay;
@@ -33,13 +33,13 @@ mod apply_type;
 mod apply_view_index;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Confidence {
+pub(crate) enum Confidence {
     Exact,
     Tainted,
 }
 
 #[derive(Debug, PartialEq, Eq)]
-pub enum MutationResult {
+pub(crate) enum MutationResult {
     Applied,
     Skipped,
     /// PostgreSQL did not execute this statement because an earlier statement
@@ -85,14 +85,14 @@ where
 }
 
 #[derive(Debug, Default, Clone)]
-pub struct CascadeResult {
+pub(crate) struct CascadeResult {
     pub dropped_relations: HashSet<ObjectId>,
     pub dropped_indexes: HashSet<ObjectId>,
     pub dropped_constraints: HashSet<(ObjectId, String)>,
 }
 
 #[derive(Clone)]
-pub struct LocalState {
+pub(crate) struct LocalState {
     pub schemas: HashMap<String, SchemaOverlay>,
     pub relations: HashMap<ObjectId, RelationOverlay>,
     pub types: HashMap<ObjectId, TypeOverlay>,
@@ -103,6 +103,9 @@ pub struct LocalState {
     pub roles: HashMap<ObjectId, crate::_internal::model::role::RoleOverlay>,
     pub role_membership_grantors: Vec<crate::_internal::model::role::RoleMembershipGrantor>,
     pub role_membership_grantors_complete: bool,
+    /// The cluster's bootstrap superuser, attributed with modern PostgreSQL's
+    /// implicit superuser grantor. Absent when unknown or unset.
+    pub bootstrap_superuser: Option<String>,
     pub triggers: HashMap<ObjectId, TriggerOverlay>,
     pub constraints: HashMap<(ObjectId, String), ConstraintState>,
     pub graph: DependencyGraph,
@@ -148,7 +151,7 @@ pub struct LocalState {
 }
 
 #[derive(Clone, Debug, Default, PartialEq)]
-pub struct PreState {
+pub(crate) struct PreState {
     pub relations: HashMap<ObjectId, crate::_internal::model::relation::RelationState>,
     pub functions: HashMap<ObjectId, crate::_internal::model::function::FunctionState>,
     pub roles: HashMap<ObjectId, crate::_internal::model::role::RoleState>,
@@ -211,6 +214,7 @@ mod pre_state_tests {
                 has_predicate: false,
                 is_concurrent: false,
                 is_unique: false,
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -238,7 +242,7 @@ mod pre_state_tests {
 }
 
 #[derive(Clone)]
-pub struct AnalysisState {
+pub(crate) struct AnalysisState {
     pub pg_version_num: Option<u32>,
     /// Whether the initial cache was loaded from a real cache file. An empty
     /// cache can be a valid baseline for an empty database, so availability
@@ -263,6 +267,7 @@ pub struct AnalysisState {
     pub scoped_external_relation_dependencies: HashSet<ObjectId>,
     pub scoped_external_type_dependencies: HashSet<ObjectId>,
     pub scoped_external_routine_dependencies: HashSet<ObjectId>,
+    pub scoped_external_index_dependencies: HashSet<ObjectId>,
     pub local: LocalState,
 }
 
@@ -459,10 +464,30 @@ impl AnalysisState {
         &self,
         scope: &crate::_internal::analysis::facts::PublicationScope,
     ) -> bool {
+        let schema_has_complete_inheritance = |schema: &str| {
+            let scope_id = ObjectId::new(schema, "");
+            self.baseline_covers_family_object(
+                &scope_id,
+                crate::_internal::db::cache::CatalogFamily::Relations,
+            ) && self.baseline_covers_family_object(
+                &scope_id,
+                crate::_internal::db::cache::CatalogFamily::Inheritance,
+            )
+        };
         match scope {
-            // FOR ALL TABLES necessarily depends on the complete catalog and
-            // future table/inheritance state, neither of which Cache V6 stores.
-            crate::_internal::analysis::facts::PublicationScope::AllTables { .. } => true,
+            crate::_internal::analysis::facts::PublicationScope::AllTables { .. } => {
+                !self.baseline_available
+                    || !matches!(
+                        self.baseline_coverage.schema_scope,
+                        crate::_internal::db::cache::SchemaCoverage::AllNonSystem
+                    )
+                    || !self
+                        .baseline_coverage
+                        .has(crate::_internal::db::cache::CatalogFamily::Relations)
+                    || !self
+                        .baseline_coverage
+                        .has(crate::_internal::db::cache::CatalogFamily::Inheritance)
+            }
             crate::_internal::analysis::facts::PublicationScope::Explicit(objects) => {
                 objects.iter().any(|object| match object {
                     crate::_internal::analysis::facts::PublicationObjectFact::Table {
@@ -472,19 +497,21 @@ impl AnalysisState {
                         ..
                     } if !only || *include_partitions => {
                         let id = self.resolve_relation_id(name);
-                        !matches!(
+                        let is_local = matches!(
                             self.local.relations.get(&id),
                             Some(RelationOverlay::Present(relation)) if relation.generation > 0
-                        ) || self.local.graph.edges().iter().any(|edge| {
-                            matches!(edge.kind, DependencyKind::PartitionOf)
-                                && self.local.graph.resolve_rename(&edge.referenced)
-                                    == self.local.graph.resolve_rename(&id)
-                        })
+                        );
+                        !is_local && !schema_has_complete_inheritance(&id.schema)
                     }
-                    // Schema-wide and current-schema shorthand scopes also
-                    // include inherited/partitioned descendants.
-                    crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables { .. }
-                    | crate::_internal::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand => true,
+                    crate::_internal::analysis::facts::PublicationObjectFact::SchemaTables {
+                        schema,
+                        ..
+                    } => !schema_has_complete_inheritance(schema),
+                    crate::_internal::analysis::facts::PublicationObjectFact::CurrentSchemaShorthand => self
+                        .local
+                        .search_path
+                        .first()
+                        .is_none_or(|schema| !schema_has_complete_inheritance(schema)),
                     crate::_internal::analysis::facts::PublicationObjectFact::Unknown => false,
                     _ => false,
                 })
@@ -581,12 +608,14 @@ impl AnalysisState {
         params.push(option.clone());
     }
 
-    pub fn new(cache: DbCache) -> Self {
+    #[cfg(test)]
+    pub(crate) fn new(cache: DbCache) -> Self {
         Self::with_baseline(cache, true)
     }
 
     /// Construct an authoritative state only from a semantically valid cache.
-    pub fn try_new(cache: DbCache) -> Result<Self, String> {
+    #[cfg(test)]
+    pub(crate) fn try_new(cache: DbCache) -> Result<Self, String> {
         Ok(Self::new(cache.validated()?))
     }
 
@@ -744,11 +773,17 @@ impl AnalysisState {
             .map(|(id, type_state)| (id.clone(), TypeOverlay::Present(type_state.clone())))
             .collect::<HashMap<_, _>>();
         let type_catalog = types.clone();
+        let row_types: HashSet<_> = relations.keys().cloned().collect();
         for overlay in relations.values_mut() {
             if let RelationOverlay::Present(relation) = overlay {
                 for column in &mut relation.columns {
                     column.type_id = column.data_type.as_deref().and_then(|raw| {
-                        Self::resolve_type_reference_from_catalog(raw, &type_catalog, search_path)
+                        Self::resolve_type_reference_from_catalog(
+                            raw,
+                            &type_catalog,
+                            search_path,
+                            |id| row_types.contains(id),
+                        )
                     });
                 }
             }
@@ -767,6 +802,7 @@ impl AnalysisState {
                     base_type,
                     &type_catalog,
                     search_path,
+                    |id| row_types.contains(id),
                 );
             }
         }
@@ -778,7 +814,7 @@ impl AnalysisState {
         }
     }
 
-    pub fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
+    pub(crate) fn with_baseline(cache: DbCache, baseline_available: bool) -> Self {
         let baseline_coverage = cache.coverage.clone();
         let baseline_boundary_queries_complete =
             baseline_available && cache.metadata.boundary_queries_complete;
@@ -832,7 +868,7 @@ impl AnalysisState {
             .as_ref()
             .map(|schemas| schemas.iter().cloned().collect());
         let HydratedRelationTypes {
-            relations,
+            mut relations,
             baseline_relations,
             baseline_fk_dependencies,
             types,
@@ -864,6 +900,11 @@ impl AnalysisState {
             .collect();
         let scoped_external_routine_dependencies = cache
             .scoped_external_routine_dependencies
+            .iter()
+            .cloned()
+            .collect();
+        let scoped_external_index_dependencies = cache
+            .scoped_external_index_dependencies
             .iter()
             .cloned()
             .collect();
@@ -923,6 +964,7 @@ impl AnalysisState {
                     has_predicate: idx.has_predicate,
                     is_concurrent: false,
                     is_unique: idx.is_unique,
+                    is_immediate: idx.is_immediate,
                     is_valid: idx.is_valid,
                     is_ready: idx.is_ready,
                     is_live: idx.is_live,
@@ -982,14 +1024,16 @@ impl AnalysisState {
         }
 
         for inheritance in cache.inheritances {
-            // Cache validation rejects a detach-in-progress row, so every
-            // hydrated edge represents a stable direct relationship. Keep
-            // cross-scope endpoints too: they are evidence that an in-scope
-            // destructive change may have an omitted dependent.
+            // A committed first phase of DETACH CONCURRENTLY remains visible
+            // as an inheritance row with inhdetachpending until FINALIZE.
+            // Keep cross-scope endpoints too: they are evidence that an
+            // in-scope destructive change may have an omitted dependent.
             graph.add_edge(DependencyEdge::new(
                 inheritance.child,
                 inheritance.parent,
-                if inheritance.is_partition {
+                if inheritance.detach_pending {
+                    DependencyKind::PartitionDetachPending
+                } else if inheritance.is_partition {
                     DependencyKind::PartitionOf
                 } else {
                     DependencyKind::InheritanceOf
@@ -1048,12 +1092,18 @@ impl AnalysisState {
 
         for t in cache.triggers {
             let trigger_key = Self::trigger_key(&t.table_id, &t.trigger_id.name);
+            if let Some(RelationOverlay::Present(relation)) = relations.get_mut(&t.table_id) {
+                relation.triggers.insert(t.trigger_id.name.clone());
+            }
             triggers.insert(
                 trigger_key.clone(),
                 TriggerOverlay::Present(crate::_internal::model::trigger::TriggerState {
                     name: t.trigger_id.name.clone(),
                     id: trigger_key.clone(),
                     table_id: t.table_id.clone(),
+                    function_id: t.function_id.clone(),
+                    row_level: t.row_level,
+                    parent_trigger_id: t.parent_trigger_id.clone(),
                     enabled_mode: t.enabled_mode,
                     generation: 0,
                 }),
@@ -1087,6 +1137,7 @@ impl AnalysisState {
                             raw,
                             &type_catalog,
                             &default_search_path,
+                            |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                         )
                     })
                     .collect();
@@ -1094,6 +1145,7 @@ impl AnalysisState {
                     &function.return_type,
                     &type_catalog,
                     &default_search_path,
+                    |id| matches!(relations.get(id), Some(RelationOverlay::Present(_))),
                 );
             }
         }
@@ -1162,6 +1214,7 @@ impl AnalysisState {
             scoped_external_relation_dependencies,
             scoped_external_type_dependencies,
             scoped_external_routine_dependencies,
+            scoped_external_index_dependencies,
             local: LocalState {
                 schemas,
                 relations,
@@ -1182,6 +1235,7 @@ impl AnalysisState {
                     .collect(),
                 role_membership_grantors: cache.role_membership_grantors,
                 role_membership_grantors_complete: cache.role_membership_grantors_complete,
+                bootstrap_superuser: cache.bootstrap_superuser,
                 triggers,
                 constraints,
                 graph,
@@ -1225,15 +1279,19 @@ impl AnalysisState {
 
     /// Construct state from a cache after validating its cross-record
     /// invariants, preserving the requested baseline-availability flag.
-    pub fn try_with_baseline(cache: DbCache, baseline_available: bool) -> Result<Self, String> {
+    pub(crate) fn try_with_baseline(
+        cache: DbCache,
+        baseline_available: bool,
+    ) -> Result<Self, String> {
         Ok(Self::with_baseline(cache.validated()?, baseline_available))
     }
 
-    pub fn get_relation(&self, id: &ObjectId) -> Option<&RelationOverlay> {
+    #[cfg(test)]
+    pub(crate) fn get_relation(&self, id: &ObjectId) -> Option<&RelationOverlay> {
         self.local.relations.get(id)
     }
 
-    pub fn resolve_function_schema(
+    pub(crate) fn resolve_function_schema(
         &self,
         name: &crate::_internal::ast::identifiers::QualifiedName,
         sig_str: &str,
@@ -1254,7 +1312,7 @@ impl AnalysisState {
             .unwrap_or_else(|| "public".to_string())
     }
 
-    pub fn resolve_relation_id(
+    pub(crate) fn resolve_relation_id(
         &self,
         name: &crate::_internal::ast::identifiers::QualifiedName,
     ) -> ObjectId {
@@ -1280,7 +1338,7 @@ impl AnalysisState {
         id
     }
 
-    pub fn relation_is_present(&self, id: &ObjectId) -> bool {
+    pub(crate) fn relation_is_present(&self, id: &ObjectId) -> bool {
         matches!(
             self.local.relations.get(id),
             Some(RelationOverlay::Present(_))
@@ -1303,7 +1361,7 @@ impl AnalysisState {
     /// Returns whether a cache-backed absence is authoritative for an object.
     /// A scoped cache only establishes absence in the schemas it actually
     /// synchronized.
-    pub fn baseline_covers_object(&self, id: &ObjectId) -> bool {
+    pub(crate) fn baseline_covers_object(&self, id: &ObjectId) -> bool {
         // V7 validation requires these scopes to agree. Keep the legacy
         // metadata intersection while direct in-process cache construction is
         // supported, so a caller cannot accidentally turn an explicitly
@@ -1380,6 +1438,9 @@ impl AnalysisState {
         }
         if matches!(family, crate::_internal::db::cache::CatalogFamily::Routines) {
             return self.scoped_external_routine_dependencies.contains(id);
+        }
+        if matches!(family, crate::_internal::db::cache::CatalogFamily::Indexes) {
+            return self.scoped_external_index_dependencies.contains(id);
         }
         true
     }
@@ -1626,7 +1687,7 @@ impl AnalysisState {
         }
     }
 
-    pub fn baseline_scope_omits_displayed_object<'a>(
+    pub(crate) fn baseline_scope_omits_displayed_object<'a>(
         &self,
         object_name: &'a str,
     ) -> Option<&'a str> {
@@ -1657,16 +1718,20 @@ impl AnalysisState {
         raw: &str,
         types: &HashMap<ObjectId, TypeOverlay>,
         search_path: &[String],
+        row_type_exists: impl Fn(&ObjectId) -> bool,
     ) -> Option<ObjectId> {
         let (schema, name) = Self::parse_type_reference(raw)?;
         if let Some(schema) = schema {
             let candidate = ObjectId::new(schema, name);
-            return matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
-                .then_some(candidate);
+            return (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
+                || row_type_exists(&candidate))
+            .then_some(candidate);
         }
         search_path.iter().find_map(|schema| {
             let candidate = ObjectId::new(schema, &name);
-            matches!(types.get(&candidate), Some(TypeOverlay::Present(_))).then_some(candidate)
+            (matches!(types.get(&candidate), Some(TypeOverlay::Present(_)))
+                || row_type_exists(&candidate))
+            .then_some(candidate)
         })
     }
 
@@ -1725,7 +1790,17 @@ impl AnalysisState {
     }
 
     fn resolve_type_reference(&self, raw: &str) -> Option<ObjectId> {
-        Self::resolve_type_reference_from_catalog(raw, &self.local.types, &self.local.search_path)
+        Self::resolve_type_reference_from_catalog(
+            raw,
+            &self.local.types,
+            &self.local.search_path,
+            |id| {
+                matches!(
+                    self.local.relations.get(id),
+                    Some(RelationOverlay::Present(_))
+                )
+            },
+        )
     }
 
     fn type_reference_name(id: &ObjectId, qualified: bool) -> String {
@@ -1798,12 +1873,67 @@ impl AnalysisState {
             })
             .find(|candidate| {
                 !reserved.contains(candidate)
-                    && !self
-                        .local
-                        .constraints
-                        .contains_key(&(table.clone(), candidate.clone()))
+                    // PostgreSQL's ChooseConstraintName checks the namespace,
+                    // even though explicit constraint names are table-local.
+                    && !self.local.constraints.keys().any(|(owner, name)| {
+                        owner.schema == table.schema && name == candidate
+                    })
             })
             .expect("constraint suffix space is unbounded")
+    }
+
+    pub(super) fn next_generated_relation_name_avoiding(
+        &self,
+        schema: &str,
+        name1: &str,
+        name2: Option<&str>,
+        label: &str,
+        reserved: &HashSet<ObjectId>,
+    ) -> ObjectId {
+        (0..)
+            .map(|suffix| {
+                let label = if suffix == 0 {
+                    label.to_string()
+                } else {
+                    format!("{label}{suffix}")
+                };
+                ObjectId::new(schema, Self::postgres_object_name(name1, name2, &label))
+            })
+            .find(|candidate| {
+                !reserved.contains(candidate) && !self.relation_namespace_is_taken(candidate)
+            })
+            .expect("relation suffix space is unbounded")
+    }
+
+    pub(super) fn next_generated_statistics_name_avoiding(
+        &self,
+        schema: &str,
+        table: &str,
+        columns: &[String],
+        reserved: &HashSet<ObjectId>,
+    ) -> ObjectId {
+        (0..)
+            .map(|suffix| {
+                let label = if suffix == 0 {
+                    "stat".to_string()
+                } else {
+                    format!("stat{suffix}")
+                };
+                ObjectId::new(
+                    schema,
+                    Self::postgres_object_name(table, Some(&columns.join("_")), &label),
+                )
+            })
+            .find(|candidate| {
+                !reserved.contains(candidate)
+                    && !self.local.relations.values().any(|overlay| match overlay {
+                        RelationOverlay::Present(relation) => {
+                            relation.extended_statistics.contains_key(candidate)
+                        }
+                        RelationOverlay::Dropped => false,
+                    })
+            })
+            .expect("extended-statistics suffix space is unbounded")
     }
 
     fn postgres_object_name(name1: &str, name2: Option<&str>, label: &str) -> String {
@@ -1873,7 +2003,11 @@ impl AnalysisState {
         }
     }
 
-    pub fn column_was_added_in_transaction(&self, table_id: &ObjectId, column: &str) -> bool {
+    pub(crate) fn column_was_added_in_transaction(
+        &self,
+        table_id: &ObjectId,
+        column: &str,
+    ) -> bool {
         if self.local.transactions.is_empty() {
             return false;
         }
@@ -1899,7 +2033,8 @@ impl AnalysisState {
         false
     }
 
-    pub fn capture_pre_state(&self) -> PreState {
+    #[cfg(test)]
+    pub(crate) fn capture_pre_state(&self) -> PreState {
         let mut pre_state = PreState::default();
         self.capture_pre_state_into(&mut pre_state);
         pre_state
@@ -1980,7 +2115,7 @@ impl AnalysisState {
         baseline_foreign_keys.clone_from(&self.baseline_foreign_keys);
     }
 
-    pub fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
+    pub(crate) fn get_cascade_closure(&self, target_oid: &ObjectId) -> CascadeResult {
         let mut result = CascadeResult::default();
         let mut visited = HashSet::new();
         self.walk_cascade(target_oid, &mut visited, &mut result);
@@ -2334,6 +2469,121 @@ impl AnalysisState {
                     .current_role_known
                     .then(|| ObjectId::new("", self.local.current_role.clone()))
             })
+    }
+
+    /// Identity attributed to a role-membership grantor.  Role grants differ
+    /// from object grants: PostgreSQL 18 routes an implicit grantor through
+    /// `BOOTSTRAP_SUPERUSERID` when the session user is a superuser, so a
+    /// superuser session records the *bootstrap* role instead of the session
+    /// role.  An explicit `GRANTED BY` always wins; otherwise a known
+    /// superuser maps to the cached bootstrap name (falling back to the
+    /// session identity when that is unknown), and any other role uses
+    /// itself.  `None` means the attribution cannot be resolved statically.
+    fn role_membership_grantor(
+        &self,
+        granted_by: Option<&crate::_internal::analysis::facts::RoleFact>,
+    ) -> Option<ObjectId> {
+        granted_by
+            .and_then(|fact| {
+                self.role_fact_identity(fact)
+                    .map(|(name, _)| ObjectId::new("", name))
+            })
+            .or_else(|| {
+                if !self.local.current_role_known {
+                    return None;
+                }
+                let current = ObjectId::new("", self.local.current_role.clone());
+                let is_superuser = matches!(
+                    self.local.roles.get(&current),
+                    Some(crate::_internal::model::role::RoleOverlay::Present(role))
+                        if role.is_superuser
+                );
+                if is_superuser {
+                    self.local
+                        .bootstrap_superuser
+                        .as_ref()
+                        .map(|name| ObjectId::new("", name.clone()))
+                } else {
+                    Some(current)
+                }
+            })
+    }
+
+    /// Index of the role-membership record for this exact
+    /// (member, role, grantor) triple, if present.
+    fn membership_record_index(
+        &self,
+        member: &ObjectId,
+        role: &ObjectId,
+        grantor: &ObjectId,
+    ) -> Option<usize> {
+        self.local
+            .role_membership_grantors
+            .iter()
+            .position(|record| {
+                &record.member == member && &record.role == role && &record.grantor == grantor
+            })
+    }
+
+    /// Whether the member still holds the ADMIN option on `role` through a
+    /// record other than `exclude`, mirroring PostgreSQL's
+    /// `would_still_have_admin_option`.
+    fn membership_admin_from_other_record(
+        &self,
+        member: &ObjectId,
+        role: &ObjectId,
+        exclude: Option<usize>,
+    ) -> bool {
+        self.local
+            .role_membership_grantors
+            .iter()
+            .enumerate()
+            .any(|(index, record)| {
+                Some(index) != exclude
+                    && &record.member == member
+                    && &record.role == role
+                    && record.admin
+            })
+    }
+
+    /// Rebuild a member's option-vector projection from its membership
+    /// records.  The effective projection is the union of the per-grantor
+    /// records, matching both `load_roles` aggregation and the live option
+    /// vectors the differential harness compares against.  No-op when the
+    /// provenance set is incomplete.
+    fn reconcile_membership_projection(&mut self, member: &ObjectId) {
+        if !self.local.role_membership_grantors_complete {
+            return;
+        }
+        let Some(crate::_internal::model::role::RoleOverlay::Present(role)) =
+            self.local.roles.get_mut(member)
+        else {
+            return;
+        };
+        role.member_of.clear();
+        role.can_administer_membership.clear();
+        role.can_inherit_from.clear();
+        role.can_set_role_to.clear();
+        for record in &self.local.role_membership_grantors {
+            if &record.member != member {
+                continue;
+            }
+            if !role.member_of.contains(&record.role) {
+                role.member_of.push(record.role.clone());
+            }
+            if record.admin && !role.can_administer_membership.contains(&record.role) {
+                role.can_administer_membership.push(record.role.clone());
+            }
+            if record.inherit && !role.can_inherit_from.contains(&record.role) {
+                role.can_inherit_from.push(record.role.clone());
+            }
+            if record.set && !role.can_set_role_to.contains(&record.role) {
+                role.can_set_role_to.push(record.role.clone());
+            }
+        }
+        // Reuse the role vector ordering the synchronizer produces: empty
+        // edge lists carry no ordering constraint, and the harness compares
+        // both live options and sim projections as unordered sets.
     }
 
     fn authorize_relation_grant(
@@ -2695,7 +2945,7 @@ impl AnalysisState {
         }
     }
 
-    pub fn apply(
+    pub(crate) fn apply(
         &mut self,
         mutation: &Mutation,
         precomputed_cascade: Option<&CascadeResult>,
@@ -2763,6 +3013,8 @@ impl AnalysisState {
             Mutation::DropView(drop) => self.apply_drop_view(drop),
             Mutation::DropMaterializedView(drop) => self.apply_drop_materialized_view(drop),
             Mutation::DropIndex(drop) => self.apply_drop_index(drop),
+            Mutation::LockTable(lock) => self.apply_lock_table(lock),
+            Mutation::Truncate(truncate) => self.apply_truncate(truncate),
             Mutation::ChangeRelationOwner { id, new_owner } => {
                 self.apply_change_relation_owner(id, new_owner)
             }
@@ -3078,7 +3330,7 @@ impl AnalysisState {
     }
 
     /// Adds conservative-analysis evidence and marks later chain state tainted.
-    pub fn record_evidence(&mut self, mut record: EvidenceRecord) {
+    pub(crate) fn record_evidence(&mut self, mut record: EvidenceRecord) {
         if record.location.is_none() {
             record.location = self.local.current_evidence_location.clone();
         }
@@ -3101,11 +3353,11 @@ impl AnalysisState {
         self.local.current_evidence_location = location;
     }
 
-    pub fn evidence(&self) -> &[EvidenceRecord] {
+    pub(crate) fn evidence(&self) -> &[EvidenceRecord] {
         self.local.evidence.records()
     }
 
-    pub fn confidence(&self) -> &Confidence {
+    pub(crate) fn confidence(&self) -> &Confidence {
         &self.local.confidence
     }
 
@@ -3360,6 +3612,11 @@ mod evidence_tests {
                 avg_width: Some(4),
                 default_expr_text: None,
                 type_modifier: None,
+                storage: None,
+                compression: None,
+                statistics_target: None,
+                options: Default::default(),
+                generated: None,
             })
             .collect();
         relation
@@ -3639,6 +3896,7 @@ mod evidence_tests {
                 owner: ObjectId::new("", "postgres"),
                 owned_by: None,
                 kind: crate::_internal::model::sequence::SequenceKind::Standalone,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -3684,6 +3942,7 @@ mod evidence_tests {
                 owner: ObjectId::new("", "postgres"),
                 owned_by: None,
                 kind: crate::_internal::model::sequence::SequenceKind::Standalone,
+                parameters: Default::default(),
                 generation: 0,
             },
         );
@@ -3728,6 +3987,7 @@ mod evidence_tests {
         let result = state.apply(
             &Mutation::AlterTable(crate::_internal::analysis::mutations::AlterTable {
                 id: table_id.clone(),
+                only: false,
                 action:
                     crate::_internal::analysis::mutations::AlterTableActionMutation::DropColumn {
                         name: "id".to_string(),
@@ -4196,6 +4456,9 @@ mod evidence_tests {
                 name: "stale_trigger".to_string(),
                 id: trigger_id.clone(),
                 table_id: ObjectId::new("old_schema", "table"),
+                function_id: ObjectId::new("other_schema", "fn()"),
+                row_level: true,
+                parent_trigger_id: None,
                 enabled_mode: crate::_internal::model::trigger::TriggerEnableMode::Origin,
                 generation: 0,
             }),
@@ -4237,6 +4500,7 @@ mod evidence_tests {
             name: "parent_pkey".to_string(),
             kind: crate::_internal::model::constraint::ConstraintKind::PrimaryKey,
             validated: true,
+            definition: None,
             backing_index: None,
         });
         cache

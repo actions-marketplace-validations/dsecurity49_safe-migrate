@@ -210,6 +210,27 @@ CREATE TABLE sm_core.t_large (
     col2 integer,
     created_at timestamptz
 );
+
+-- Shared source for LIKE cloning of generated/identity columns, CHECKs,
+-- indexes, storage settings, and extended statistics.
+CREATE TABLE sm_core.catalog_like_source (
+    id bigint GENERATED ALWAYS AS IDENTITY
+        (START WITH 10 INCREMENT BY 2 CACHE 5),
+    a integer NOT NULL CONSTRAINT catalog_like_source_a_check CHECK (a > 0),
+    b text,
+    doubled integer GENERATED ALWAYS AS (a * 2) STORED
+);
+ALTER TABLE sm_core.catalog_like_source ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE sm_core.catalog_like_source ALTER COLUMN b SET STATISTICS 250;
+CREATE INDEX catalog_like_source_a_idx ON sm_core.catalog_like_source (a);
+CREATE STATISTICS sm_core.catalog_like_source_stats (dependencies, ndistinct)
+    ON a, b FROM sm_core.catalog_like_source;
+ALTER STATISTICS sm_core.catalog_like_source_stats SET STATISTICS 250;
+CREATE TABLE sm_core.catalog_rules (id integer);
+CREATE RULE rule_origin AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_disabled AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_replica AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_always AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
 CREATE UNIQUE INDEX t_large_col1_prebuilt_key ON sm_core.t_large (col1);
 
 CREATE TABLE sm_core.items (

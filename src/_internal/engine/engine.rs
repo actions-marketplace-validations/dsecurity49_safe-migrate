@@ -4,10 +4,10 @@ use crate::_internal::analysis::outcome::AnalysisOutcome;
 use crate::_internal::analysis::resolver::Resolver;
 use crate::_internal::analysis::state::{AnalysisState, PreState};
 use crate::_internal::ast::visitor::AstVisitor;
-use crate::_internal::engine::config::Config;
 use crate::_internal::report::violations::{ReportFinding, SourceLocation, Violation};
 use crate::_internal::rules::registry;
 use crate::_internal::rules::{Rule, RuleContext};
+use crate::api::config::Config;
 use squawk_syntax::{
     Parse, SyntaxKind,
     ast::{AstNode, SourceFile},
@@ -68,13 +68,13 @@ impl StatementCheckpoint {
     }
 }
 
-pub struct SafeMigrateEngine {
+pub(crate) struct SafeMigrateEngine {
     config: Config,
     rules: Vec<Box<dyn Rule>>,
 }
 
 impl SafeMigrateEngine {
-    pub fn new(config: Config) -> Self {
+    pub(crate) fn new(config: Config) -> Self {
         Self {
             config,
             rules: registry::build_primary_rules(),
@@ -82,11 +82,13 @@ impl SafeMigrateEngine {
     }
 
     /// Returns primary rule IDs in evaluation order.
-    pub fn primary_rule_ids(&self) -> Vec<&'static str> {
+    #[cfg(test)]
+    pub(crate) fn primary_rule_ids(&self) -> Vec<&'static str> {
         registry::primary_rule_ids().collect()
     }
 
-    pub fn analyze_chain(
+    #[cfg(test)]
+    pub(crate) fn analyze_chain(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -115,7 +117,8 @@ impl SafeMigrateEngine {
         Ok(all_violations)
     }
 
-    pub fn analyze(
+    #[cfg(test)]
+    pub(crate) fn analyze(
         &self,
         sql: &str,
         state: &mut AnalysisState,
@@ -126,7 +129,7 @@ impl SafeMigrateEngine {
     /// Analyze ordered files and retain reportable source locations for every
     /// finding. The original `analyze_chain` API remains available to callers
     /// that only need violations.
-    pub fn analyze_chain_with_locations(
+    pub(crate) fn analyze_chain_with_locations(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -184,7 +187,8 @@ impl SafeMigrateEngine {
         Ok(findings.into_iter().map(|(_, finding)| finding).collect())
     }
 
-    pub fn analyze_with_locations(
+    #[cfg(test)]
+    pub(crate) fn analyze_with_locations(
         &self,
         filename: String,
         sql: String,
@@ -195,7 +199,7 @@ impl SafeMigrateEngine {
 
     /// Analyze a migration chain and return immutable findings, confidence, and
     /// conservative-analysis evidence together.
-    pub fn analyze_chain_outcome_with_locations(
+    pub(crate) fn analyze_chain_outcome_with_locations(
         &self,
         files: &[(String, String)],
         state: &mut AnalysisState,
@@ -210,7 +214,8 @@ impl SafeMigrateEngine {
 
     /// Analyze one migration and return immutable findings, confidence, and
     /// conservative-analysis evidence together.
-    pub fn analyze_outcome_with_locations(
+    #[cfg(test)]
+    pub(crate) fn analyze_outcome_with_locations(
         &self,
         filename: String,
         sql: String,
@@ -219,6 +224,7 @@ impl SafeMigrateEngine {
         self.analyze_chain_outcome_with_locations(&[(filename, sql)], state)
     }
 
+    #[cfg(test)]
     fn analyze_single_file(
         &self,
         filename: &str,
@@ -229,6 +235,7 @@ impl SafeMigrateEngine {
         self.analyze_normalized_file(filename, &sql, state)
     }
 
+    #[cfg(test)]
     fn analyze_normalized_file(
         &self,
         filename: &str,
@@ -319,7 +326,22 @@ impl SafeMigrateEngine {
             if squawk_linter::analyze::possibly_slow_stmt(&stmt) {
                 mutations.push(Mutation::CheckTimeouts);
             }
+            let started_in_transaction = state.in_transaction();
+            let transaction_control = mutations.iter().any(|mutation| {
+                matches!(
+                    mutation,
+                    Mutation::BeginTransaction
+                        | Mutation::CommitTransaction
+                        | Mutation::CommitAndChain
+                        | Mutation::RollbackTransaction
+                        | Mutation::RollbackAndChain
+                        | Mutation::RollbackToSavepoint(_)
+                        | Mutation::Savepoint(_)
+                        | Mutation::ReleaseSavepoint(_)
+                )
+            });
             let mut statement_checkpoint = StatementCheckpoint::capture(state, &mutations);
+            let mut statement_failed = false;
 
             for mutation in mutations {
                 let pre_cascade = match &mutation {
@@ -332,7 +354,7 @@ impl SafeMigrateEngine {
                 state.capture_pre_state_into(&mut pre_state);
                 let result = state.apply(&mutation, pre_cascade.as_ref());
 
-                let statement_failed = matches!(
+                statement_failed = matches!(
                     result,
                     crate::_internal::analysis::state::MutationResult::Conflict { .. }
                 );
@@ -445,6 +467,14 @@ impl SafeMigrateEngine {
                 if statement_failed {
                     break;
                 }
+            }
+
+            if !statement_failed
+                && !started_in_transaction
+                && !transaction_control
+                && !state.in_transaction()
+            {
+                state.apply_implicit_commit_actions();
             }
 
             warned_keys.extend(statement_warned_keys);

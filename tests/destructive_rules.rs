@@ -1,5 +1,3 @@
-mod common;
-
 mod destructive_rule_tests {
     use crate::common::*;
     use safe_migrate::_internal::analysis::state::AnalysisState;
@@ -85,6 +83,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(104),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), relation);
 
@@ -166,6 +169,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(259),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), rel);
 
@@ -206,6 +214,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(54),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache2.insert_baseline(object_id("public", "t"), rel2);
         let mut state2 = AnalysisState::new(cache2);
@@ -249,6 +262,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: None, // text has no modifier
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), rel);
 

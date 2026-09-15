@@ -441,6 +441,9 @@ impl AnalysisState {
                 has_predicate: create.has_predicate,
                 is_concurrent: create.concurrently,
                 is_unique: create.unique,
+                // PostgreSQL-created indexes are immediate unless a
+                // constraint later adopts them with deferred semantics.
+                is_immediate: true,
                 is_valid: true,
                 is_ready: true,
                 is_live: true,
@@ -591,7 +594,7 @@ impl AnalysisState {
             // Scoped index rows do not yet carry a complete backing-constraint
             // identity or every external dependency, so PostgreSQL's DROP
             // INDEX conflict semantics cannot be proven from the partial
-            // graph. Leave the baseline unchanged until V7 index ownership
+            // graph. Leave the baseline unchanged until index ownership
             // coverage is object-complete.
             self.taint(
                 EvidenceCode::CatalogCoverageIncomplete,
@@ -682,10 +685,34 @@ impl AnalysisState {
                 return MutationResult::Skipped;
             }
         }
-        self.snapshot_graph();
+        let table_indexes = self
+            .local
+            .graph
+            .edges()
+            .iter()
+            .filter(|edge| {
+                matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
+                    && targets.iter().any(|target| {
+                        self.local.graph.resolve_rename(target)
+                            == self.local.graph.resolve_rename(&edge.dependent)
+                    })
+            })
+            .map(|edge| (edge.referenced.clone(), edge.dependent.name.clone()))
+            .collect::<Vec<_>>();
+        for (table, index_name) in table_indexes {
+            self.snapshot_relation(&table);
+            if let Some(RelationOverlay::Present(relation)) = self.local.relations.get_mut(&table) {
+                relation.clear_index_settings(&index_name);
+            }
+        }
+        self.snapshot_graph_full();
+        let resolution_graph = self.local.graph.clone();
         self.local.graph.retain_edges(|edge| {
             !(matches!(edge.kind, DependencyKind::IndexOnRelation { .. })
-                && targets.contains(&edge.dependent))
+                && targets.iter().any(|target| {
+                    resolution_graph.resolve_rename(target)
+                        == resolution_graph.resolve_rename(&edge.dependent)
+                }))
         });
         MutationResult::Applied
     }
