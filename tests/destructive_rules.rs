@@ -1,12 +1,10 @@
-mod common;
-
 mod destructive_rule_tests {
     use crate::common::*;
-    use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::ast::identifiers::ObjectId;
-    use safe_migrate::model::column::Column;
-    use safe_migrate::model::relation::{Persistence, RelationKind, RelationState};
-    use safe_migrate::report::violations::ViolationTier;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
+    use safe_migrate::_internal::ast::identifiers::ObjectId;
+    use safe_migrate::_internal::model::column::Column;
+    use safe_migrate::_internal::model::relation::{Persistence, RelationKind, RelationState};
+    use safe_migrate::_internal::report::violations::ViolationTier;
 
     #[test]
     fn test_rule_drop_view_cascade() {
@@ -66,8 +64,8 @@ mod destructive_rule_tests {
     fn test_rule_type_change_rewrite_varchar_to_text() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
-        let mut relation = safe_migrate::model::relation::RelationState::new(
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut relation = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
             0,
@@ -85,6 +83,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(104),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), relation);
 
@@ -104,7 +107,7 @@ mod destructive_rule_tests {
     #[test]
     fn test_rule_type_change_narrow_varchar_unbounded() {
         let engine = setup_engine();
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         let tid = object_id("public", "t");
         let mut rel = RelationState::new(
             tid.clone(),
@@ -115,12 +118,14 @@ mod destructive_rule_tests {
             Persistence::Permanent,
             0,
         );
-        rel.apply_column_action(&safe_migrate::model::relation::ColumnAction::Add {
-            name: "val".to_string(),
-            data_type: Some("varchar".to_string()),
-            not_null: false,
-            default: None,
-        });
+        rel.apply_column_action(
+            &safe_migrate::_internal::model::relation::ColumnAction::Add {
+                name: "val".to_string(),
+                data_type: Some("varchar".to_string()),
+                not_null: false,
+                default: None,
+            },
+        );
         cache.insert_baseline(tid, rel);
         let mut state = AnalysisState::new(cache);
 
@@ -144,8 +149,8 @@ mod destructive_rule_tests {
     fn test_rule_varchar_narrowing_lossy() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
-        let mut rel = safe_migrate::model::relation::RelationState::new(
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut rel = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
             0,
@@ -164,6 +169,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(259),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), rel);
 
@@ -185,8 +195,8 @@ mod destructive_rule_tests {
         );
 
         // Now try widening: varchar(50) → varchar(255) should NOT flag as lossy
-        let mut cache2 = safe_migrate::db::cache::DbCache::new();
-        let mut rel2 = safe_migrate::model::relation::RelationState::new(
+        let mut cache2 = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut rel2 = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
             0,
@@ -204,6 +214,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: Some(54),
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache2.insert_baseline(object_id("public", "t"), rel2);
         let mut state2 = AnalysisState::new(cache2);
@@ -228,8 +243,8 @@ mod destructive_rule_tests {
     fn test_rule_text_to_varchar_narrowing() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
-        let mut rel = safe_migrate::model::relation::RelationState::new(
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
+        let mut rel = safe_migrate::_internal::model::relation::RelationState::new(
             object_id("public", "t"),
             ObjectId::new("public", "postgres"),
             0,
@@ -247,6 +262,11 @@ mod destructive_rule_tests {
             avg_width: None,
             default_expr_text: None,
             type_modifier: None, // text has no modifier
+            storage: None,
+            compression: None,
+            statistics_target: None,
+            options: Default::default(),
+            generated: None,
         });
         cache.insert_baseline(object_id("public", "t"), rel);
 
@@ -271,10 +291,10 @@ mod destructive_rule_tests {
     #[test]
     fn test_rule_drift_detection_drop_missing_table() {
         // Simulate a live DB cache with table "existing_tbl"
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "existing_tbl"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -308,10 +328,10 @@ mod destructive_rule_tests {
     /// DriftDetectionRule: ALTER TABLE that doesn't exist in baseline → Tier 1
     #[test]
     fn test_rule_drift_detection_alter_missing_table() {
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "existing_tbl"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -342,10 +362,10 @@ mod destructive_rule_tests {
 
     #[test]
     fn test_rule_drift_detection_drop_existing_table() {
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "existing_tbl"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "existing_tbl"),
                 ObjectId::new("public", "postgres"),
                 0,
@@ -416,10 +436,10 @@ mod destructive_rule_tests {
     fn test_rule_type_change_rewrite_unsafe_small() {
         let engine = setup_engine();
 
-        let mut cache = safe_migrate::db::cache::DbCache::new();
+        let mut cache = safe_migrate::_internal::db::cache::DbCache::new();
         cache.insert_baseline(
             object_id("public", "t"),
-            safe_migrate::model::relation::RelationState::new(
+            safe_migrate::_internal::model::relation::RelationState::new(
                 object_id("public", "t"),
                 ObjectId::new("public", "postgres"),
                 0,

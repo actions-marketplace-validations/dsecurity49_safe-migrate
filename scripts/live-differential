@@ -1,13 +1,17 @@
 #!/bin/sh
 set -eu
 
+repository_root=$(CDPATH='' cd -- "$(dirname "$0")/.." && pwd)
+cd "$repository_root"
+
 verbosity=0
 rule_filter=""
 fixture_filter=""
 
 usage() {
     printf '%s\n' "Usage: scripts/live-differential [-v|-vv|-vvv] [--rule RULE_DIRECTORY] [--fixture RULE_DIRECTORY/FILE.sql[,RULE_DIRECTORY/FILE.sql...]]"
-    printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database."
+    printf '%s\n' "Requires DATABASE_URL for a disposable PostgreSQL database (defaults to database safe_migrate)."
+    printf '%s\n' "Set SAFE_MIGRATE_DIFF_DATABASE when using a different local database name."
 }
 
 while [ "$#" -gt 0 ]; do
@@ -23,7 +27,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --rule)
             shift
-            if [ "$#" -eq 0 ]; then
+            if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 usage >&2
                 exit 2
             fi
@@ -31,7 +35,7 @@ while [ "$#" -gt 0 ]; do
             ;;
         --fixture)
             shift
-            if [ "$#" -eq 0 ]; then
+            if [ "$#" -eq 0 ] || [ -z "$1" ]; then
                 usage >&2
                 exit 2
             fi
@@ -67,5 +71,6 @@ else
     unset SAFE_MIGRATE_DIFF_FIXTURE
 fi
 
-cargo test --locked --test live_differential_harness \
-    live_postgres_differential_harness -- --ignored --nocapture
+cargo test --locked --lib \
+    internal_tests::live_differential_harness::live_postgres_differential_harness \
+    -- --exact --ignored --nocapture

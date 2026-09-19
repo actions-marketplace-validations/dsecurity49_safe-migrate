@@ -1,11 +1,9 @@
-mod common;
-
 mod invariant_sequences {
     use crate::common::invariants::{assert_cache_invariants, assert_state_invariants};
     use crate::common::{cache_with_table, object_id, setup_engine, setup_state};
-    use safe_migrate::analysis::state::AnalysisState;
-    use safe_migrate::model::relation::RelationOverlay;
-    use safe_migrate::model::schema::SchemaOverlay;
+    use safe_migrate::_internal::analysis::state::AnalysisState;
+    use safe_migrate::_internal::model::relation::RelationOverlay;
+    use safe_migrate::_internal::model::schema::SchemaOverlay;
 
     fn analyze_and_validate(state: &mut AnalysisState, sql: &str) {
         let findings = setup_engine()
@@ -249,10 +247,12 @@ mod invariant_sequences {
                     .expect("structure-aware statement should analyze");
                 assert_state_invariants(&state);
                 reports.push(
-                    serde_json::to_string(&safe_migrate::Reporter::json_report(
-                        &findings,
-                        &state.local.confidence,
-                    ))
+                    serde_json::to_string(
+                        &crate::_internal::report::reporter::Reporter::json_report(
+                            &findings,
+                            &state.local.confidence,
+                        ),
+                    )
                     .expect("report should serialize"),
                 );
             }

@@ -1,11 +1,12 @@
 # Local benchmark baseline
 
 This document records reproducible, non-CI performance scenarios. The values
-are comparison points for the later `0.7.0` work, not performance guarantees.
+are comparison points for the recorded `0.8.0` hardening work, not performance
+guarantees.
 Run them with:
 
 ```sh
-cargo test --locked --test performance_scenarios -- --ignored --nocapture
+cargo test --locked --lib internal_tests::performance_scenarios -- --ignored --nocapture
 ```
 
 The scenarios validate final state as well as timing, so an apparent speedup
@@ -37,11 +38,11 @@ checkpoint-capture, and isolated dependency-query measurements require a
 profiler or allocator instrumentation and are deliberately not inferred from
 these wall-clock samples.
 
-## Optimized-profile `v0.7.0` structural baseline
+## Optimized-profile `v0.8.0` structural baseline
 
 Captured on 2026-08-28 from commit `b639b04` using Rust 1.98.0 on the same
 aarch64 Android Linux environment. This run uses Cargo's optimized `release`
-profile and is the comparison point for evidence-gated `v0.7.0` work; it is not
+profile and is the comparison point for evidence-gated `v0.8.0` work; it is not
 comparable to the debug timings above and is not a performance guarantee.
 
 | Scenario | Statements | Elapsed |
@@ -67,7 +68,7 @@ the same aarch64 Android Linux host and optimized profile described above.
 Run future comparisons with the same command and profile:
 
 ```sh
-cargo test --release --locked --test performance_scenarios -- --ignored --nocapture --test-threads=1
+cargo test --release --locked --lib internal_tests::performance_scenarios -- --ignored --nocapture --test-threads=1
 ```
 
 The allocation scenarios use a process-global counting allocator. Run them
@@ -109,7 +110,7 @@ The returned public fields and values remain unchanged; an equivalence test
 compares incremental capture with a fresh capture after update, insertion, and
 removal mutations.
 
-Cache V6 decoding now streams decompressed bytes through the bounded bincode
+Cache V8 decoding streams decompressed bytes through the bounded bincode
 reader instead of retaining a second, fully decompressed byte vector. This is a
 structural peak-memory reduction, not an RSS claim: authenticated decryption
 still completes before decompression, the 256 MiB decoded-size bound remains
@@ -142,5 +143,5 @@ The indexed path was about **6.3x faster** while returning the same edge count.
 Run the isolated comparison with:
 
 ```sh
-cargo test --locked --jobs 1 --test performance_scenarios large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
+cargo test --locked --jobs 1 --lib internal_tests::performance_scenarios::large_dependency_graph_lookup_index -- --ignored --nocapture --test-threads=1
 ```

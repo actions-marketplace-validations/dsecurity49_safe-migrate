@@ -2,7 +2,7 @@ use std::fs;
 use std::io::Read;
 use std::path::Path;
 
-use safe_migrate::db::cache::{CACHE_V6_MAGIC, DbCacheVersioned};
+use safe_migrate::_internal::db::cache::{CACHE_V8_MAGIC, DbCacheVersioned};
 
 fn run_auto_sync_case(
     database_url: &str,
@@ -18,7 +18,7 @@ fn run_auto_sync_case(
     fs::write(&config_path, "auto_sync = true\nschemas = [\"public\"]\n")
         .expect("write live auto-sync config");
 
-    let mut command = assert_cmd::Command::cargo_bin("safe-migrate").expect("safe-migrate binary");
+    let mut command = crate::common::safe_migrate_command();
     command
         .arg(mode)
         .arg("--config")
@@ -83,15 +83,15 @@ fn run_auto_sync_case(
     decoder
         .read_to_end(&mut payload)
         .expect("read decoded cache payload");
-    let v6_payload = payload
-        .strip_prefix(CACHE_V6_MAGIC)
-        .expect("auto-sync must write a V6 cache");
+    let v7_payload = payload
+        .strip_prefix(CACHE_V8_MAGIC)
+        .expect("auto-sync must write a V8 cache");
     let config = bincode::config::standard().with_variable_int_encoding();
     let (versioned, bytes_read): (DbCacheVersioned, usize) =
-        bincode::serde::decode_from_slice(v6_payload, config).expect("decode V6 cache");
-    assert_eq!(bytes_read, v6_payload.len());
-    let DbCacheVersioned::V6(cache) = versioned else {
-        panic!("auto-sync must encode the V6 cache variant");
+        bincode::serde::decode_from_slice(v7_payload, config).expect("decode V8 cache");
+    assert_eq!(bytes_read, v7_payload.len());
+    let DbCacheVersioned::V8(cache) = versioned else {
+        panic!("auto-sync must encode the V8 cache variant");
     };
     assert_eq!(cache.metadata.source_role.as_deref(), Some(expected_role));
     assert_eq!(
@@ -117,6 +117,7 @@ fn run_auto_sync_case(
 #[test]
 #[ignore = "requires a live local PostgreSQL database via DATABASE_URL"]
 fn live_auto_sync_refreshes_lint_and_lint_chain() {
+    let _live_database_guard = crate::internal_tests::live_database_test_lock();
     let database_url =
         std::env::var("DATABASE_URL").expect("DATABASE_URL is required for live auto-sync proof");
     let mut client = postgres::Client::connect(&database_url, postgres::NoTls)

@@ -1,5 +1,24 @@
 # Contributing to safe-migrate
 
+## Start with an issue
+
+Before submitting a new issue, [search existing issues](https://github.com/dsecurity49/safe-migrate/issues),
+including closed ones, for similar reports or proposals. If one already covers
+your topic, add any new information there rather than opening a duplicate.
+
+Otherwise, [open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose).
+For substantial changes, discuss the approach before starting implementation.
+For bug reports, include:
+
+- minimal SQL;
+- expected and actual output;
+- safe-migrate version;
+- PostgreSQL version or assumed version;
+- whether a cache was used;
+- relevant configuration, with credentials and other secrets removed.
+
+## How analysis works
+
 Thanks for contributing. safe-migrate is a Rust PostgreSQL migration analyzer
 with typed AST extraction, stateful schema simulation, and safety rules.
 
@@ -22,13 +41,14 @@ then add an integration test when behavior crosses into the next stage.
 ## Project structure
 
 ```text
-src/analysis/   facts, resolution, mutations, dependency graph, state, transactions
-src/ast/        extraction from the pinned Squawk typed AST
-src/db/         versioned database cache
-src/engine/     configuration, orchestration, and rule dispatch
-src/model/      modeled PostgreSQL objects
-src/report/     human, JSON, and interactive reporting
-src/rules/      safety rule implementations
+src/_internal/analysis/   facts, resolution, mutations, dependency graph, state, transactions
+src/_internal/ast/        extraction from the pinned Squawk typed AST
+src/_internal/db/         versioned database cache
+src/_internal/engine/     configuration, orchestration, and rule dispatch
+src/_internal/model/      modeled PostgreSQL objects
+src/_internal/report/     human, JSON, and interactive reporting
+src/_internal/rules/      safety rule implementations
+src/api.rs, src/api/      supported Rust integration API
 tests/          integration, state-machine, rule, CLI, and regression tests
 live_tests/     end-to-end SQL fixtures and frozen database cache
 docs/           Action guide and CLI/report contract
@@ -54,6 +74,10 @@ cargo test rule_evaluation
 cargo test architectural_gap
 cargo test expression_parsing
 ```
+
+Implementation tests are registered under the library target (`--lib`), not
+individual `--test` targets. The independent public API suite uses
+`cargo test --locked --test api_facade`.
 
 End-to-end fixtures:
 
@@ -98,7 +122,7 @@ against PostgreSQL 14 through 18; excluded fixtures and their reasons live in
 
 ## Adding or changing a rule
 
-1. Implement one safety concept under `src/rules/`.
+1. Implement one safety concept under `src/_internal/rules/`.
 2. Register the rule in the primary rule registry.
 3. Add configuration only when the rule needs a user-controlled policy.
 4. Add focused regression tests.
@@ -123,9 +147,9 @@ Use the pinned Squawk source and grammar when changing AST extraction:
 
 1. confirm the exact Squawk versions in `Cargo.toml` and `Cargo.lock`;
 2. inspect the resolved dependency source and grammar;
-3. add an exact fact assertion in `src/ast/visitor_tests.rs`;
-4. implement extraction in `src/ast/visitor.rs` or expression conversion in
-   `src/analysis/expr_visitor.rs`;
+3. add an exact fact assertion in `src/_internal/ast/visitor_tests.rs`;
+4. implement extraction in `src/_internal/ast/visitor.rs` or expression
+   conversion in `src/_internal/analysis/expr_visitor.rs`;
 5. test resolver, state, and rule effects when behavior crosses layers;
 6. represent unsupported parser behavior explicitly.
 
@@ -181,8 +205,9 @@ The frozen cache under `live_tests/` belongs to the test corpus. Update it only
 when a fixture requires a changed baseline, and explain the assumption in the
 pull request.
 
-Cache V6 synchronizes every PostgreSQL routine kind, publications, and redacted
-subscription metadata. Never query or store `pg_subscription.subconninfo`.
+Cache V8 synchronizes every PostgreSQL routine kind, publications, redacted
+subscription metadata, and explicit catalog coverage. Never query or store
+`pg_subscription.subconninfo`.
 Changes to the cache model require serialization and inspection regressions,
 an updated frozen cache, and live catalog coverage across supported PostgreSQL
 versions.
@@ -194,15 +219,3 @@ versions.
 - Use idiomatic Rust naming and four-space indentation.
 - Keep one rule concept per file or focused module.
 - Document non-obvious undo-log and dependency-graph behavior inline.
-
-## Reporting bugs
-
-[Open an issue](https://github.com/dsecurity49/safe-migrate/issues/new/choose)
-with:
-
-- minimal SQL;
-- expected and actual output;
-- safe-migrate version;
-- PostgreSQL version or assumed version;
-- whether a cache was used;
-- relevant configuration.

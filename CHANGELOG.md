@@ -5,6 +5,75 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.1 — 2026-09-19
+
+- Stabilized typed-table catalog synchronization, preventing layout-validation
+  and type-resolution failures on PostgreSQL 15+ typed tables.
+- Fixed cross-schema synchronization so identity-generating sequences resolve
+  through the same foreign-key expansion as their owning tables.
+- Expanded `DETACH PARTITION ... CONCURRENTLY` retained-CHECK synthesis to
+  byte-exact PostgreSQL output for composite, mixed-varchar, and boundary
+  sentinel partition ranges; parenthesized partition keys are accepted
+  identically to bare names.
+- Extended retained-CHECK synthesis to LIST partitions declaring `NULL`;
+  true expression keys remain conservatively tainted.
+
+## v0.9.0 — 2026-09-15
+
+- Established `safe_migrate::api` as the supported Rust interface for analysis,
+  configuration, synchronization, and reporting; `_internal` is now private.
+- Unified API and CLI reports and evidence, with typed results, categorized
+  errors, and redacted database/cache-key inputs for embedded callers.
+- Added `table-lock` to flag explicit blocking locks, bringing the rule count
+  to 29.
+- Expanded SQL modeling for `TRUNCATE`, storage and column settings, inheritance,
+  partition detach, `SELECT INTO`, sequence options, and temporary-table commits.
+- Added Cache V8 metadata for CHECK definitions, extended statistics, column
+  inheritance, generated/identity columns, and partition-trigger parentage.
+- Improved constraint/index rename and drop propagation, generated CHECK names,
+  expression preservation, `LIKE` copies, and replica-identity eligibility checks.
+- Fixed concurrent-detach state and recursive rename collisions; invalidate
+  descendant predicates after ancestry changes. Unsupported predicate forms
+  remain conservative.
+- Track PostgreSQL 16+ role-membership grantors and per-grant options for more
+  accurate `REVOKE`/`CASCADE` analysis.
+- Hardened rollback, baseline/version validation, secret cleanup, and report
+  rendering; reject unsupported PostgreSQL-version assumptions.
+- Expanded live catalog comparisons and interrupted-detach coverage, repaired
+  the CI smoke-test target, and improved live scripts and crate packaging.
+
+## v0.8.1 — 2026-09-06
+
+- Upgraded Squawk's parser, lexer, syntax tree, and linter to 2.64.0, including
+  its stricter routine validation and more precise type and transaction nodes.
+- Preserved ordered-set aggregate and function signatures across the new AST,
+  and stopped prepared-transaction completion from ending the analyzed
+  migration transaction.
+- Warn before GitHub secret setup when the baseline environment is missing,
+  unverifiable, or lacks reviewer or deployment-branch protection.
+- Prevent `cargo test` from opening the interactive viewer when run from a
+  terminal.
+
+## v0.8.0 — 2026-09-04
+
+- Rule evaluation now uses one immutable context with explicit capability
+  declarations and scoped evidence for missing catalog or transaction state.
+- Cache hydration preserves namespace evidence across typed dependencies,
+  publications, constraints, indexes, triggers, and generated/default links.
+- Cache V7 records PostgreSQL-selected foreign-key equality operators and
+  rejects incomplete proof; validated cache/state constructors keep malformed
+  programmatic baselines conservative.
+- Large dependency graphs reuse indexed rename and reverse-dependency lookups
+  while preserving the existing small-graph behavior.
+- Added the supported `safe_migrate::api` Rust façade for configuration, cache,
+  analysis, findings, and evidence consumers, including managed analysis helpers
+  that validate caches before hydration.
+- Cache validation now rejects circular or internally inconsistent role
+  membership edges before synchronized state can be treated as authoritative.
+- Split GitHub Actions into trusted baseline refresh and offline PR analysis.
+  The initializer generates both, environment-scopes database credentials, and
+  makes the encrypted baseline mandatory for normal analysis.
+
 ## v0.7.0 — 2026-08-30
 
 - Fixed `sync --out <filename>` for bare relative cache filenames and made the

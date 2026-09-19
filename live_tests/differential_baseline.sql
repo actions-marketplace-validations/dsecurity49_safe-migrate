@@ -26,6 +26,7 @@ DROP TABLE IF EXISTS public.list_parent CASCADE;
 DROP TABLE IF EXISTS public.range_parent CASCADE;
 DROP TABLE IF EXISTS public.hash_parent CASCADE;
 DROP TABLE IF EXISTS public.test_table CASCADE;
+DROP PUBLICATION IF EXISTS mypub;
 
 CREATE SCHEMA IF NOT EXISTS public;
 DO $baseline_role$
@@ -50,7 +51,11 @@ BEGIN
         'sm_set_member',
         'sm_set_bridge',
         'sm_set_target',
-        'sm_no_set_target'
+        'sm_no_set_target',
+        'sm_option_member',
+        'sm_option_parent',
+        'sm_inherit_member',
+        'sm_inherit_parent'
     ] LOOP
         IF NOT EXISTS (SELECT 1 FROM pg_roles WHERE rolname = role_name) THEN
             EXECUTE format('CREATE ROLE %I NOLOGIN', role_name);
@@ -68,6 +73,20 @@ BEGIN
     END IF;
 END
 $set_option_membership$;
+DO $membership_option_membership$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 160000 THEN
+        EXECUTE 'GRANT sm_option_parent TO sm_option_member WITH ADMIN TRUE, INHERIT FALSE, SET FALSE';
+    END IF;
+END
+$membership_option_membership$;
+DO $inherit_option_membership$
+BEGIN
+    IF current_setting('server_version_num')::integer >= 160000 THEN
+        EXECUTE 'GRANT sm_inherit_parent TO sm_inherit_member WITH INHERIT TRUE, SET FALSE';
+    END IF;
+END
+$inherit_option_membership$;
 
 CREATE SCHEMA sm_identity;
 CREATE SCHEMA sm_core;
@@ -191,6 +210,27 @@ CREATE TABLE sm_core.t_large (
     col2 integer,
     created_at timestamptz
 );
+
+-- Shared source for LIKE cloning of generated/identity columns, CHECKs,
+-- indexes, storage settings, and extended statistics.
+CREATE TABLE sm_core.catalog_like_source (
+    id bigint GENERATED ALWAYS AS IDENTITY
+        (START WITH 10 INCREMENT BY 2 CACHE 5),
+    a integer NOT NULL CONSTRAINT catalog_like_source_a_check CHECK (a > 0),
+    b text,
+    doubled integer GENERATED ALWAYS AS (a * 2) STORED
+);
+ALTER TABLE sm_core.catalog_like_source ALTER COLUMN b SET STORAGE MAIN;
+ALTER TABLE sm_core.catalog_like_source ALTER COLUMN b SET STATISTICS 250;
+CREATE INDEX catalog_like_source_a_idx ON sm_core.catalog_like_source (a);
+CREATE STATISTICS sm_core.catalog_like_source_stats (dependencies, ndistinct)
+    ON a, b FROM sm_core.catalog_like_source;
+ALTER STATISTICS sm_core.catalog_like_source_stats SET STATISTICS 250;
+CREATE TABLE sm_core.catalog_rules (id integer);
+CREATE RULE rule_origin AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_disabled AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_replica AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
+CREATE RULE rule_always AS ON INSERT TO sm_core.catalog_rules DO ALSO NOTHING;
 CREATE UNIQUE INDEX t_large_col1_prebuilt_key ON sm_core.t_large (col1);
 
 CREATE TABLE sm_core.items (
@@ -243,6 +283,7 @@ CREATE TABLE public.test_table (
     data text,
     ts timestamptz
 );
+CREATE PUBLICATION mypub FOR TABLE public.test_table;
 CREATE INDEX test_table_note_idx ON public.test_table (note);
 
 CREATE TABLE public.child_table (

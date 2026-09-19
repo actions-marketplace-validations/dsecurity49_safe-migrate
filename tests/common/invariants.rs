@@ -1,18 +1,18 @@
-use safe_migrate::analysis::graph::DependencyKind;
-use safe_migrate::analysis::state::AnalysisState;
-use safe_migrate::analysis::transaction::TransactionFrameKind;
-use safe_migrate::db::cache::DbCache;
-use safe_migrate::model::function::FunctionOverlay;
-use safe_migrate::model::relation::RelationOverlay;
-use safe_migrate::model::replication::{PublicationOverlay, SubscriptionOverlay};
-use safe_migrate::model::role::RoleOverlay;
-use safe_migrate::model::schema::SchemaOverlay;
-use safe_migrate::model::sequence::SequenceOverlay;
-use safe_migrate::model::trigger::TriggerOverlay;
-use safe_migrate::model::types::TypeOverlay;
+use safe_migrate::_internal::analysis::graph::DependencyKind;
+use safe_migrate::_internal::analysis::state::AnalysisState;
+use safe_migrate::_internal::analysis::transaction::TransactionFrameKind;
+use safe_migrate::_internal::db::cache::DbCache;
+use safe_migrate::_internal::model::function::FunctionOverlay;
+use safe_migrate::_internal::model::relation::RelationOverlay;
+use safe_migrate::_internal::model::replication::{PublicationOverlay, SubscriptionOverlay};
+use safe_migrate::_internal::model::role::RoleOverlay;
+use safe_migrate::_internal::model::schema::SchemaOverlay;
+use safe_migrate::_internal::model::sequence::SequenceOverlay;
+use safe_migrate::_internal::model::trigger::TriggerOverlay;
+use safe_migrate::_internal::model::types::TypeOverlay;
 use std::collections::HashSet;
 
-pub fn assert_cache_invariants(cache: &DbCache) {
+pub(crate) fn assert_cache_invariants(cache: &DbCache) {
     for (id, relation) in &cache.relations {
         assert_eq!(
             id, &relation.id,
@@ -94,7 +94,7 @@ pub fn assert_cache_invariants(cache: &DbCache) {
     }
 }
 
-pub fn assert_state_invariants(state: &AnalysisState) {
+pub(crate) fn assert_state_invariants(state: &AnalysisState) {
     let local = &state.local;
     assert!(
         local.graph.indexes_are_valid(),
@@ -202,7 +202,7 @@ pub fn assert_state_invariants(state: &AnalysisState) {
                 let dependent_is_modeled_view = matches!(
                     local.relations.get(&edge.dependent),
                     Some(RelationOverlay::Present(relation))
-                        if matches!(relation.kind, safe_migrate::model::relation::RelationKind::View | safe_migrate::model::relation::RelationKind::MaterializedView)
+                        if matches!(relation.kind, safe_migrate::_internal::model::relation::RelationKind::View | safe_migrate::_internal::model::relation::RelationKind::MaterializedView)
                 );
                 let dependent_schema_is_omitted = state
                     .baseline_schemas
@@ -238,10 +238,21 @@ pub fn assert_state_invariants(state: &AnalysisState) {
                     .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
                 "constraint key edge must have a matching constraint"
             ),
+            DependencyKind::ConstraintDependency {
+                constraint_name, ..
+            } => assert!(
+                local
+                    .constraints
+                    .contains_key(&(edge.dependent.clone(), constraint_name.clone())),
+                "constraint dependency edge must have a matching constraint"
+            ),
             DependencyKind::IndexOnRelation { .. }
             | DependencyKind::RenameTo
+            | DependencyKind::InheritanceOf
             | DependencyKind::PartitionOf
+            | DependencyKind::PartitionDetachPending
             | DependencyKind::ColumnGeneratedFrom { .. }
+            | DependencyKind::ColumnDefaultOnSequence { .. }
             | DependencyKind::ForeignKey {
                 constraint_name: None,
                 ..
