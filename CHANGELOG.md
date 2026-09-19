@@ -5,6 +5,19 @@ commits and pull requests. Published binaries, checksums, and generated release
 notes are available on the
 [GitHub Releases page](https://github.com/dsecurity49/safe-migrate/releases).
 
+## v0.9.1 — 2026-09-19
+
+- Stabilized typed-table catalog synchronization, preventing layout-validation
+  and type-resolution failures on PostgreSQL 15+ typed tables.
+- Fixed cross-schema synchronization so identity-generating sequences resolve
+  through the same foreign-key expansion as their owning tables.
+- Expanded `DETACH PARTITION ... CONCURRENTLY` retained-CHECK synthesis to
+  byte-exact PostgreSQL output for composite, mixed-varchar, and boundary
+  sentinel partition ranges; parenthesized partition keys are accepted
+  identically to bare names.
+- Extended retained-CHECK synthesis to LIST partitions declaring `NULL`;
+  true expression keys remain conservatively tainted.
+
 ## v0.9.0 — 2026-09-15
 
 - Established `safe_migrate::api` as the supported Rust interface for analysis,

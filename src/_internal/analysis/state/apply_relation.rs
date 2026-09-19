@@ -7075,12 +7075,14 @@ impl AnalysisState {
     }
 
     /// Split a `PARTITION BY <strategy> (c1, c2, ...)` key into column names.
-    /// Plain identifiers and quoted identifiers are accepted; expressions and
-    /// opclass/collation annotations return `None`, because PostgreSQL then
-    /// deparses the retained predicate in terms of the expression, not a
-    /// column.
+    /// Plain, quoted, and parenthesized plain identifiers (e.g. `(a)`,
+    /// `((b))`) resolve to the bare column, matching PostgreSQL's retained
+    /// predicate. True expressions (operators, calls, casts) and
+    /// collation/opclass/sort annotations return `None`, because PostgreSQL
+    /// deparses them in normalized form we cannot replicate byte-for-byte;
+    /// those keys keep the conservative `CantResolve` taint.
     fn partition_key_columns(&self, parent: &ObjectId) -> Option<Vec<(String, String)>> {
-        use squawk_syntax::ast::{AstNode, Expr, PartitionBy, SourceFile};
+        use squawk_syntax::ast::{AstNode, PartitionBy, SourceFile};
         let Some(RelationOverlay::Present(parent)) = self.local.relations.get(parent) else {
             return None;
         };
@@ -7103,15 +7105,29 @@ impl AnalysisState {
             {
                 return None;
             }
-            let Expr::NameRef(name) = item.expr()? else {
-                return None;
-            };
-            columns.push((name.text().to_string(), name.syntax().text().to_string()));
+            let name = Self::resolve_partition_column_name(item.expr()?)?;
+            columns.push(name);
         }
         if columns.is_empty() {
             None
         } else {
             Some(columns)
+        }
+    }
+
+    /// Unwrap parentheses to a plain column name; return `None` for any
+    /// non-column expression.
+    fn resolve_partition_column_name(expr: squawk_syntax::ast::Expr) -> Option<(String, String)> {
+        use squawk_syntax::ast::{AstNode, Expr};
+        let mut current = expr;
+        loop {
+            match current {
+                Expr::ParenExpr(paren) => current = paren.expr()?,
+                Expr::NameRef(name) => {
+                    return Some((name.text().to_string(), name.syntax().text().to_string()));
+                }
+                _ => return None,
+            }
         }
     }
 
@@ -7195,78 +7211,199 @@ impl AnalysisState {
         keys: &[(String, String)],
         relation: &RelationState,
     ) -> Option<String> {
-        if keys.len() != 1 {
+        let clauses = self.synthesize_partition_check_clauses(strategy, bound, keys, relation)?;
+        Some(format!("({})", clauses.join(" AND ")))
+    }
+
+    fn synthesize_partition_check_clauses(
+        &self,
+        strategy: &str,
+        bound: &str,
+        keys: &[(String, String)],
+        relation: &RelationState,
+    ) -> Option<Vec<String>> {
+        if keys.is_empty() {
             return None;
         }
-        let (key_name, key) = &keys[0];
-        let column_type = relation
-            .columns
-            .iter()
-            .find(|column| &column.name == key_name)
-            .and_then(|column| column.data_type.as_deref())?;
-        let comparison_left = if column_type.starts_with("character varying") {
-            format!("({key})::text")
-        } else {
-            key.clone()
-        };
+
+        let mut column_types = Vec::new();
+        let mut comparison_lefts = Vec::new();
+
+        for (key_name, key) in keys {
+            let col_type = relation
+                .columns
+                .iter()
+                .find(|c| &c.name == key_name)
+                .and_then(|c| c.data_type.as_deref())?;
+
+            let comp_left = if col_type.starts_with("character varying") {
+                format!("({key})::text")
+            } else {
+                key.clone()
+            };
+
+            column_types.push(col_type);
+            comparison_lefts.push(comp_left);
+        }
+
+        let typed_bound = parse_typed_bound(bound)?;
+
         if strategy.eq_ignore_ascii_case("RANGE") {
-            let lower = extract_paren_group(bound, "FROM (")?;
-            let upper = extract_paren_group(bound, "TO (")?;
-            let lower_datums = split_top_level(&lower, ',');
-            let upper_datums = split_top_level(&upper, ',');
+            let TypedBound::FromTo {
+                from: lower_datums,
+                to: upper_datums,
+            } = typed_bound
+            else {
+                return None;
+            };
+
             if lower_datums.len() != upper_datums.len() || lower_datums.len() != keys.len() {
                 return None;
             }
-            let lower = lower_datums[0].trim();
-            let upper = upper_datums[0].trim();
-            let mut clauses = vec![format!("({key} IS NOT NULL)")];
-            if !lower.eq_ignore_ascii_case("MINVALUE") {
-                let literal = deparse_partition_literal(column_type, lower)?;
-                clauses.push(format!("({comparison_left} >= {literal})"));
+
+            let mut clauses = Vec::new();
+            for (_, key) in keys {
+                clauses.push(format!("({key} IS NOT NULL)"));
             }
-            if !upper.eq_ignore_ascii_case("MAXVALUE") {
-                let literal = deparse_partition_literal(column_type, upper)?;
-                clauses.push(format!("({comparison_left} < {literal})"));
+
+            let mut k_lower = keys.len();
+            for (i, datum) in lower_datums.iter().enumerate() {
+                if matches!(datum.kind, DatumKind::UnboundedMin) {
+                    k_lower = i;
+                    break;
+                }
             }
-            Some(format!("({})", clauses.join(" AND ")))
+
+            if k_lower > 0 {
+                let mut or_clauses = Vec::new();
+                for (i, datum) in lower_datums.iter().take(k_lower).enumerate() {
+                    let mut and_clauses = Vec::new();
+                    for (j, prev) in lower_datums.iter().take(i).enumerate() {
+                        let literal = deparse_partition_literal(column_types[j], &prev.text)?;
+                        and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
+                    }
+                    let literal = deparse_partition_literal(column_types[i], &datum.text)?;
+                    if i == k_lower - 1 {
+                        and_clauses.push(format!("({} >= {})", comparison_lefts[i], literal));
+                    } else {
+                        and_clauses.push(format!("({} > {})", comparison_lefts[i], literal));
+                    }
+
+                    if and_clauses.len() == 1 {
+                        or_clauses.push(and_clauses[0].clone());
+                    } else {
+                        or_clauses.push(format!("({})", and_clauses.join(" AND ")));
+                    }
+                }
+                if or_clauses.len() == 1 {
+                    clauses.push(or_clauses[0].clone());
+                } else {
+                    clauses.push(format!("({})", or_clauses.join(" OR ")));
+                }
+            }
+
+            let mut k_upper = keys.len();
+            let mut is_maxvalue = false;
+            for (i, datum) in upper_datums.iter().enumerate() {
+                if matches!(datum.kind, DatumKind::UnboundedMax) {
+                    k_upper = i;
+                    is_maxvalue = true;
+                    break;
+                } else if matches!(datum.kind, DatumKind::UnboundedMin) {
+                    k_upper = i;
+                    break;
+                }
+            }
+
+            if k_upper > 0 {
+                let mut or_clauses = Vec::new();
+                for (i, datum) in upper_datums.iter().take(k_upper).enumerate() {
+                    let mut and_clauses = Vec::new();
+                    for (j, prev) in upper_datums.iter().take(i).enumerate() {
+                        let literal = deparse_partition_literal(column_types[j], &prev.text)?;
+                        and_clauses.push(format!("({} = {})", comparison_lefts[j], literal));
+                    }
+                    let literal = deparse_partition_literal(column_types[i], &datum.text)?;
+                    if i == k_upper - 1 && is_maxvalue {
+                        and_clauses.push(format!("({} <= {})", comparison_lefts[i], literal));
+                    } else {
+                        and_clauses.push(format!("({} < {})", comparison_lefts[i], literal));
+                    }
+
+                    if and_clauses.len() == 1 {
+                        or_clauses.push(and_clauses[0].clone());
+                    } else {
+                        or_clauses.push(format!("({})", and_clauses.join(" AND ")));
+                    }
+                }
+                if or_clauses.len() == 1 {
+                    clauses.push(or_clauses[0].clone());
+                } else {
+                    clauses.push(format!("({})", or_clauses.join(" OR ")));
+                }
+            }
+
+            Some(clauses)
         } else if strategy.eq_ignore_ascii_case("LIST") {
-            let inner = extract_paren_group(bound, "IN (")?;
-            let datums = split_top_level(&inner, ',');
-            match datums.as_slice() {
+            if keys.len() != 1 {
+                return None;
+            }
+            let (_, key) = &keys[0];
+            let column_type = column_types[0];
+            let comparison_left = &comparison_lefts[0];
+
+            let TypedBound::In(datums) = typed_bound else {
+                return None;
+            };
+
+            let has_null = datums.iter().any(|d| matches!(d.kind, DatumKind::Null));
+            let non_null_datums: Vec<_> = datums
+                .iter()
+                .filter(|d| !matches!(d.kind, DatumKind::Null))
+                .collect();
+
+            if non_null_datums.is_empty() {
+                if has_null {
+                    return Some(vec![format!("({key} IS NULL)")]);
+                }
+                return None;
+            }
+
+            let value_check = match non_null_datums.as_slice() {
                 [single] => {
-                    let literal = deparse_partition_literal(column_type, single.trim())?;
+                    let literal = deparse_partition_literal(column_type, &single.text)?;
                     if column_type == "boolean" {
-                        let narrow = if literal == "true" {
+                        if literal == "true" {
                             key.clone()
                         } else if literal == "false" {
                             format!("(NOT {key})")
                         } else {
                             return None;
-                        };
-                        return Some(format!("(({key} IS NOT NULL) AND {narrow})"));
+                        }
+                    } else {
+                        format!("({comparison_left} = {literal})")
                     }
-                    Some(format!(
-                        "(({key} IS NOT NULL) AND ({comparison_left} = {literal}))"
-                    ))
                 }
-                [] => None,
+                [] => return None, // handled above, but for exhaustiveness
                 _ => {
                     let mut values = Vec::new();
-                    for datum in datums {
-                        values.push(decode_sql_literal(datum.trim())?);
+                    for datum in non_null_datums {
+                        values.push(decode_sql_literal(&datum.text)?);
                     }
                     let mapped = elements_for_array(&values, column_type)?;
                     if matches!(column_type, "integer" | "smallint" | "bigint") {
-                        return Some(format!(
-                            "(({key} IS NOT NULL) AND ({comparison_left} = ANY (ARRAY[{}])))",
-                            mapped.join(", ")
-                        ));
+                        format!("({comparison_left} = ANY (ARRAY[{}]))", mapped.join(", "))
+                    } else {
+                        let array_text = serialize_array_literal(&mapped);
+                        format!("({comparison_left} = ANY ('{array_text}'::{column_type}[]))")
                     }
-                    let array_text = serialize_array_literal(&mapped);
-                    Some(format!(
-                        "(({key} IS NOT NULL) AND ({comparison_left} = ANY ('{array_text}'::{column_type}[])))"
-                    ))
                 }
+            };
+
+            if has_null {
+                Some(vec![format!("(({key} IS NULL) OR {value_check})")])
+            } else {
+                Some(vec![format!("({key} IS NOT NULL)"), value_check])
             }
         } else {
             None
@@ -7300,20 +7437,15 @@ impl AnalysisState {
                 if bound.eq_ignore_ascii_case("DEFAULT") {
                     return None;
                 }
-                let predicate = self.synthesize_partition_check(strategy, bound, &keys, child)?;
-                let predicate = if predicate.starts_with("((") && predicate.ends_with("))") {
-                    let inner = &predicate[1..predicate.len() - 1];
-                    if let Some(separator) = inner.find(") AND (") {
-                        let first = &inner[..separator + 1];
-                        let rest = &inner[separator + 6..];
-                        format!("({first} AND ({rest}))")
-                    } else {
-                        predicate
-                    }
+                let clauses =
+                    self.synthesize_partition_check_clauses(strategy, bound, &keys, child)?;
+                if clauses.len() >= 2 {
+                    let first = &clauses[0];
+                    let rest = clauses[1..].join(" AND ");
+                    Some(format!("({first} AND ({rest}))"))
                 } else {
-                    predicate
-                };
-                Some(predicate)
+                    Some(format!("({})", clauses[0]))
+                }
             })
             .collect::<Vec<_>>();
         if predicates.is_empty() {
@@ -7361,54 +7493,36 @@ impl AnalysisState {
 /// the bound forms represented by the typed Squawk node.
 fn canonical_partition_bound(bound: &str) -> String {
     let trimmed = bound.trim();
-    if trimmed.eq_ignore_ascii_case("DEFAULT") {
-        return "DEFAULT".into();
+    let Some(typed) = parse_typed_bound(trimmed) else {
+        return trimmed.to_string();
+    };
+    match typed {
+        TypedBound::Default => "DEFAULT".to_string(),
+        TypedBound::In(datums) => {
+            let values = datums
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("FOR VALUES IN ({values})")
+        }
+        TypedBound::FromTo { from, to } => {
+            let from_str = from
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            let to_str = to
+                .into_iter()
+                .map(|d| d.text)
+                .collect::<Vec<_>>()
+                .join(", ");
+            format!("FOR VALUES FROM ({from_str}) TO ({to_str})")
+        }
+        TypedBound::With { modulus, remainder } => {
+            format!("FOR VALUES WITH ({modulus}, {remainder})")
+        }
     }
-    let upper = trimmed.to_ascii_uppercase();
-    if upper.starts_with("FOR VALUES IN (") {
-        let inner = &trimmed["FOR VALUES IN (".len()..trimmed.len().saturating_sub(1)];
-        let values = split_top_level(inner, ',')
-            .into_iter()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("FOR VALUES IN ({values})");
-    }
-    if upper.starts_with("FOR VALUES FROM (")
-        && let (Some(from), Some(to)) = (
-            extract_paren_group(trimmed, "FROM ("),
-            extract_paren_group(trimmed, "TO ("),
-        )
-    {
-        let from = split_top_level(&from, ',')
-            .into_iter()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(", ");
-        let to = split_top_level(&to, ',')
-            .into_iter()
-            .map(str::trim)
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("FOR VALUES FROM ({from}) TO ({to})");
-    }
-    if upper.starts_with("FOR VALUES WITH (")
-        && let Some(inner) = extract_paren_group(trimmed, "WITH (")
-    {
-        let values = split_top_level(&inner, ',')
-            .into_iter()
-            .map(str::trim)
-            .map(|value| {
-                let mut words = value.splitn(2, char::is_whitespace);
-                let key = words.next().unwrap_or_default().to_ascii_lowercase();
-                let rest = words.next().unwrap_or_default().trim();
-                format!("{key} {rest}")
-            })
-            .collect::<Vec<_>>()
-            .join(", ");
-        return format!("FOR VALUES WITH ({values})");
-    }
-    trimmed.to_string()
 }
 
 /// Whether PostgreSQL retains a CHECK constraint on `DETACH PARTITION
@@ -7489,43 +7603,6 @@ fn decode_sql_literal(raw: &str) -> Option<String> {
     } else {
         None
     }
-}
-
-/// Extract the balanced parenthesized content following `needle` (which must
-/// end with `(`), returning the group's inner text.
-fn extract_paren_group(input: &str, needle: &str) -> Option<String> {
-    let lowercase = input.to_ascii_lowercase();
-    let needle_lower = needle.to_ascii_lowercase();
-    let start = lowercase.find(&needle_lower)?;
-    // `needle` ends with `(`, so the group content begins right after it.
-    let content = &input[start + needle.len()..];
-    let mut depth = 0i32;
-    let mut chars = content.char_indices().peekable();
-    while let Some((index, ch)) = chars.next() {
-        match ch {
-            '(' => depth += 1,
-            ')' => {
-                if depth == 0 {
-                    return Some(content[..index].to_string());
-                }
-                depth -= 1;
-            }
-            '\'' => {
-                while let Some((_, quoted)) = chars.next() {
-                    if quoted == '\'' {
-                        match chars.peek() {
-                            Some((_, '\'')) => {
-                                chars.next();
-                            }
-                            _ => break,
-                        }
-                    }
-                }
-            }
-            _ => {}
-        }
-    }
-    None
 }
 
 /// Choose the array element type for a folded `ARRAY[...]` constant. When
@@ -7647,9 +7724,12 @@ fn fold_boolean_equality(predicate: &str) -> Option<String> {
 }
 
 /// Extract the column variable referenced by an `= ANY (...)`/`= true` clause
-/// from a fully-deparsed predicate (`((col IS NOT NULL) AND (col = ...))`).
+/// from a fully-deparsed predicate (`((col IS NOT NULL) AND (col = ...))` or
+/// `((col IS NULL) OR (col = ANY (...)))`).
 fn predicate_column_name(predicate: &str) -> Option<String> {
-    let start = predicate.find(" IS NOT NULL)")?;
+    let start = predicate
+        .find(" IS NOT NULL)")
+        .or_else(|| predicate.find(" IS NULL)"))?;
     let open = predicate[..start].rfind('(')?;
     let name = predicate[open + 1..start].trim();
     if name.is_empty() || !name.chars().all(|ch| ch.is_alphanumeric() || ch == '_') {
@@ -7745,7 +7825,8 @@ fn deparse_partition_literal(data_type: &str, raw: &str) -> Option<String> {
                 || type_name == "citext"
                 || type_name.starts_with("character varying")
                 || type_name.starts_with("character(")
-                || type_name.starts_with("bpchar") =>
+                || type_name.starts_with("bpchar")
+                || type_name.starts_with("timestamp") =>
         {
             Some(format!("'{}'::{}", decoded.replace('\'', "''"), data_type))
         }
@@ -7764,4 +7845,161 @@ fn numeric_float_like(value: &str) -> bool {
         && value[first.len_utf8()..]
             .chars()
             .any(|ch| matches!(ch, '.' | 'e' | 'E'))
+}
+
+enum DatumKind {
+    UnboundedMin,
+    UnboundedMax,
+    Null,
+    Const,
+}
+
+struct BoundDatum {
+    kind: DatumKind,
+    text: String,
+}
+
+enum TypedBound {
+    Default,
+    In(Vec<BoundDatum>),
+    FromTo {
+        from: Vec<BoundDatum>,
+        to: Vec<BoundDatum>,
+    },
+    With {
+        modulus: String,
+        remainder: String,
+    },
+}
+
+fn parse_typed_bound(bound: &str) -> Option<TypedBound> {
+    use squawk_syntax::SyntaxKind;
+    use squawk_syntax::ast::{AstNode, Expr, PartitionType, SourceFile, Stmt};
+
+    // Fast-path DEFAULT matching current canonical_partition_bound case-insensitivity
+    if bound.trim().eq_ignore_ascii_case("DEFAULT") {
+        return Some(TypedBound::Default);
+    }
+
+    // Some callers (e.g. tests) may pass a bound without the prefix.
+    let wrap = if bound.trim().to_ascii_uppercase().starts_with("FOR VALUES ") {
+        format!("CREATE TABLE __key PARTITION OF __parent () {bound}")
+    } else {
+        format!("CREATE TABLE __key PARTITION OF __parent () FOR VALUES {bound}")
+    };
+
+    let parsed = SourceFile::parse(&wrap);
+    let pt = match parsed.tree().stmts().next()? {
+        Stmt::CreateTable(c) => c.partition_type()?,
+        _ => return None,
+    };
+
+    let parse_datum = |expr: Expr| -> Option<BoundDatum> {
+        // Detect MINVALUE/MAXVALUE keyword token presence.
+        if let Some(tok) = expr.syntax().first_token() {
+            if tok.kind() == SyntaxKind::MINVALUE_KW {
+                return Some(BoundDatum {
+                    kind: DatumKind::UnboundedMin,
+                    text: expr.syntax().text().to_string(),
+                });
+            }
+            if tok.kind() == SyntaxKind::MAXVALUE_KW {
+                return Some(BoundDatum {
+                    kind: DatumKind::UnboundedMax,
+                    text: expr.syntax().text().to_string(),
+                });
+            }
+            if tok.kind() == SyntaxKind::NULL_KW {
+                return Some(BoundDatum {
+                    kind: DatumKind::Null,
+                    text: expr.syntax().text().to_string(),
+                });
+            }
+        }
+        match expr {
+            Expr::Literal(_) => Some(BoundDatum {
+                kind: DatumKind::Const,
+                text: expr.syntax().text().to_string(),
+            }),
+            Expr::PrefixExpr(pre) => {
+                let inner = pre.expr()?;
+                if matches!(inner, Expr::Literal(_))
+                    && pre
+                        .syntax()
+                        .first_token()
+                        .is_some_and(|t| t.kind() == SyntaxKind::MINUS)
+                {
+                    Some(BoundDatum {
+                        kind: DatumKind::Const,
+                        text: pre.syntax().text().to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
+            Expr::CastExpr(cast) => {
+                let inner = cast.expr()?;
+                if matches!(inner, Expr::Literal(_) | Expr::PrefixExpr(_)) {
+                    Some(BoundDatum {
+                        kind: DatumKind::Const,
+                        text: cast.syntax().text().to_string(),
+                    })
+                } else {
+                    None
+                }
+            }
+            _ => None,
+        }
+    };
+
+    match pt {
+        PartitionType::PartitionForValuesFrom(f) => {
+            let from_node = f
+                .syntax()
+                .descendants()
+                .find_map(squawk_syntax::ast::PartitionFromValues::cast)?;
+            let to_node = f
+                .syntax()
+                .descendants()
+                .find_map(squawk_syntax::ast::PartitionToValues::cast)?;
+            let mut from_datums = Vec::new();
+            for expr in from_node.exprs() {
+                from_datums.push(parse_datum(expr)?);
+            }
+            let mut to_datums = Vec::new();
+            for expr in to_node.exprs() {
+                to_datums.push(parse_datum(expr)?);
+            }
+            Some(TypedBound::FromTo {
+                from: from_datums,
+                to: to_datums,
+            })
+        }
+        PartitionType::PartitionForValuesIn(l) => {
+            let mut datums = Vec::new();
+            for expr in l.exprs() {
+                datums.push(parse_datum(expr)?);
+            }
+            Some(TypedBound::In(datums))
+        }
+        PartitionType::PartitionForValuesWith(w) => {
+            let modulus = w.modulus()?;
+            let remainder = w.remainder()?;
+            let mod_text = format!(
+                "{} {}",
+                modulus.ident_token()?.text().to_ascii_lowercase(),
+                modulus.int_number_token()?.text()
+            );
+            let rem_text = format!(
+                "{} {}",
+                remainder.ident_token()?.text().to_ascii_lowercase(),
+                remainder.int_number_token()?.text()
+            );
+            Some(TypedBound::With {
+                modulus: mod_text,
+                remainder: rem_text,
+            })
+        }
+        PartitionType::PartitionDefault(_) => Some(TypedBound::Default),
+    }
 }

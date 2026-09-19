@@ -1423,7 +1423,25 @@ fn load_sequences(
     // scope. A sequence can live in a different schema from its owning
     // table, and dropping it without that edge would make a later migration
     // look exact while missing PostgreSQL's ownership dependency.
-    let schema_filter = "AND ($1::text[] IS NULL OR n.nspname = ANY($1) OR tn.nspname = ANY($1))";
+    let schema_filter = r#"
+        AND (
+            $1::text[] IS NULL
+            OR n.nspname = ANY($1)
+            OR tn.nspname = ANY($1)
+            OR t.oid IN (
+                SELECT conrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.confrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+            OR t.oid IN (
+                SELECT confrelid FROM pg_constraint cst
+                JOIN pg_class c2 ON c2.oid = cst.conrelid
+                JOIN pg_namespace n2 ON n2.oid = c2.relnamespace
+                WHERE n2.nspname = ANY($1)
+            )
+        )
+    "#;
     let query = format!(
         "SELECT
              n.nspname AS sequence_schema,
@@ -1727,7 +1745,10 @@ fn load_relations_and_columns(
           AND c.relkind IN ('r', 'p', 'v', 'm')
           AND n.nspname NOT IN ('pg_catalog', 'information_schema')
           {schema_filter_with_fk}
-        ORDER BY n.nspname, c.relname;
+        -- Composite-type fields are ordered by pg_attribute.attnum.  Keep the
+        -- relation projection in that same order so typed-table layout
+        -- validation does not depend on PostgreSQL's join plan.
+        ORDER BY n.nspname, c.relname, a.attnum;
     "
     );
     let rows = client
@@ -2975,7 +2996,15 @@ fn load_types(
                 ARRAY[]::text[]
             ) AS composite_field_names,
             COALESCE(
-                array_agg(pg_catalog.format_type(a.atttypid, a.atttypmod) ORDER BY a.attnum)
+                array_agg(
+                    CASE WHEN field_type_ns.nspname <> 'pg_catalog'
+                              AND pg_catalog.pg_type_is_visible(a.atttypid)
+                         THEN quote_ident(field_type_ns.nspname) || '.'
+                              || pg_catalog.format_type(a.atttypid, a.atttypmod)
+                         ELSE pg_catalog.format_type(a.atttypid, a.atttypmod)
+                    END
+                    ORDER BY a.attnum
+                )
                     FILTER (WHERE a.attname IS NOT NULL),
                 ARRAY[]::text[]
             ) AS composite_field_types
@@ -2987,6 +3016,8 @@ fn load_types(
           ON a.attrelid = t.typrelid
          AND a.attnum > 0
          AND NOT a.attisdropped
+        LEFT JOIN pg_type field_type ON field_type.oid = a.atttypid
+        LEFT JOIN pg_namespace field_type_ns ON field_type_ns.oid = field_type.typnamespace
         WHERE n.nspname NOT IN ('pg_catalog', 'information_schema')
           AND t.typtype IN ('e', 'd', 'c')
           AND (t.typtype <> 'c' OR composite_rel.relkind = 'c')
